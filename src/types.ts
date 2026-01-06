@@ -18,6 +18,7 @@ export type ClaudeContent =
           | { type: 'text'; text: string }
           | { type: 'tool_use'; id: string; name: string; input: any }
           | { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean }
+          | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
       >
 
 export interface ClaudeMessage {
@@ -32,6 +33,7 @@ export interface ClaudeRequest {
     temperature?: number
     stream?: boolean
     tools?: ClaudeTool[]
+    system?: string
 }
 
 export interface ClaudeResponse {
@@ -121,9 +123,14 @@ export interface ClaudeStreamEvent {
     }
 }
 
+// OpenAI 多模态内容部分
+export type OpenAIContentPart =
+    | { type: 'text'; text: string }
+    | { type: 'image_url'; image_url: { url: string; detail?: 'auto' | 'low' | 'high' } }
+
 export interface OpenAIMessage {
     role: 'system' | 'user' | 'assistant' | 'tool'
-    content?: string | null
+    content?: string | OpenAIContentPart[] | null
     tool_calls?: OpenAIToolCall[]
     tool_call_id?: string
 }

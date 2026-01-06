@@ -3,7 +3,16 @@
     "name": "claude-worker-proxy",
     "main": "src/index.ts",
     "compatibility_date": "2025-06-20",
-    "vars": {},
+    "vars": {
+        "CLAUDE_API_KEY": "cr_792fe201363ff3d74cd3e817204c40dda90b1ac637d2fa563d9347cce8aa43b4",
+        "CLAUDE_BASE_URL": "https://as086nwvpbrnivunc.imds.ai/api"
+    },
+    "kv_namespaces": [
+        {
+            "binding": "CONFIG_KV",
+            "id": "6b64417fce3b4fd0a63c1945b8c2fdec"
+        }
+    ],
     "observability": {
         "enabled": true
     },
