@@ -37,19 +37,6 @@ function mapModelName(inputModel: string): string {
     return inputModel
 }
 
-// 是否禁用独立的 system 字段（某些代理服务不支持）
-let disableSystemField = false
-
-// 设置是否禁用 system 字段
-export function setDisableSystemField(disable: boolean) {
-    disableSystemField = disable
-}
-
-// 获取是否禁用 system 字段
-export function getDisableSystemField(): boolean {
-    return disableSystemField
-}
-
 export class ClaudeProvider implements provider.Provider {
     async convertToProviderRequest(request: Request, baseUrl: string, apiKey: string): Promise<Request> {
         const openaiRequest = (await request.json()) as types.OpenAIRequest
@@ -58,24 +45,15 @@ export class ClaudeProvider implements provider.Provider {
         // 应用模型名称映射
         const mappedModel = mapModelName(openaiRequest.model)
 
-        // 如果禁用了 system 字段，将 system 消息合并到第一个 user 消息中
-        let finalMessages = messages
-        let finalSystem: string | undefined = system
-
-        if (disableSystemField && system) {
-            finalMessages = this.mergeSystemToFirstMessage(messages, system)
-            finalSystem = undefined
-        }
-
         const claudeRequest: types.ClaudeRequest = {
             model: mappedModel,
-            messages: finalMessages,
+            messages,
             max_tokens: openaiRequest.max_tokens || 4096,
             stream: openaiRequest.stream
         }
 
-        if (finalSystem) {
-            claudeRequest.system = finalSystem
+        if (system) {
+            claudeRequest.system = system
         }
 
         if (openaiRequest.temperature !== undefined) {
@@ -101,33 +79,6 @@ export class ClaudeProvider implements provider.Provider {
             headers,
             body: JSON.stringify(claudeRequest)
         })
-    }
-
-    // 将 system 消息合并到第一个 user 消息中
-    private mergeSystemToFirstMessage(messages: types.ClaudeMessage[], system: string): types.ClaudeMessage[] {
-        if (messages.length === 0) {
-            // 如果没有消息，创建一个包含 system 的 user 消息
-            return [{ role: 'user', content: system }]
-        }
-
-        const result = [...messages]
-        const firstMessage = result[0]
-
-        // 合并 system 到第一个消息的内容中
-        if (typeof firstMessage.content === 'string') {
-            result[0] = {
-                ...firstMessage,
-                content: `${system}\n\n${firstMessage.content}`
-            }
-        } else if (Array.isArray(firstMessage.content)) {
-            // 如果是数组格式，在开头添加一个 text 块
-            result[0] = {
-                ...firstMessage,
-                content: [{ type: 'text', text: system + '\n\n' }, ...firstMessage.content]
-            }
-        }
-
-        return result
     }
 
     async convertToClaudeResponse(claudeResponse: Response): Promise<Response> {

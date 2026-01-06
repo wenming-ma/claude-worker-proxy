@@ -11,7 +11,7 @@ const KV_PROXY_CONFIG = 'proxy_config'
 const KV_REQUEST_LOGS = 'request_logs'
 const KV_LAST_REQUEST = 'last_request'
 const KV_LAST_RESPONSE = 'last_response'
-const KV_DISABLE_SYSTEM_FIELD = 'disable_system_field'
+const KV_LAST_USER_INPUT = 'last_user_input'
 
 // 日志条目类型
 interface RequestLog {
@@ -117,13 +117,6 @@ async function initConfig(env: Env) {
                     apiKey: config.apiKey || env.CLAUDE_API_KEY || ''
                 }
                 console.log('[Init] Loaded proxy config from KV')
-            }
-
-            // 加载是否禁用 system 字段的配置
-            const disableSystemField = await env.CONFIG_KV.get(KV_DISABLE_SYSTEM_FIELD)
-            if (disableSystemField) {
-                claude.setDisableSystemField(disableSystemField === 'true')
-                console.log('[Init] Loaded disableSystemField from KV:', disableSystemField)
             }
         }
     } catch (e) {
@@ -294,6 +287,12 @@ async function handleOpenAIToClaude(
         // 保存最近一次请求内容到 KV（异步后台执行）
         if (env.CONFIG_KV) {
             ctx.waitUntil(env.CONFIG_KV.put(KV_LAST_REQUEST, JSON.stringify(requestBody, null, 2)))
+
+            // 提取并保存用户最后一条输入（只保存用户在输入框中输入的内容）
+            const lastUserMessage = extractLastUserInput(requestBody.messages)
+            if (lastUserMessage) {
+                ctx.waitUntil(env.CONFIG_KV.put(KV_LAST_USER_INPUT, lastUserMessage))
+            }
         }
 
         // 检查是否有图片内容
@@ -445,6 +444,30 @@ async function handleOpenAIToClaude(
     }
 }
 
+// 提取用户最后一条输入内容（只提取用户在输入框中输入的文本）
+function extractLastUserInput(messages: any[]): string | null {
+    if (!messages || !Array.isArray(messages)) return null
+
+    // 从后往前找最后一条 user 消息
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i]
+        if (msg.role === 'user') {
+            // 处理消息内容
+            if (typeof msg.content === 'string') {
+                return msg.content
+            } else if (Array.isArray(msg.content)) {
+                // 多模态消息，只提取文本部分
+                const textParts = msg.content
+                    .filter((part: any) => part.type === 'text')
+                    .map((part: any) => part.text)
+                    .join('\n')
+                return textParts || null
+            }
+        }
+    }
+    return null
+}
+
 // 保存请求日志到 KV（只保留最近 5 条）
 async function saveRequestLog(env: Env, log: RequestLog): Promise<void> {
     if (!env.CONFIG_KV) return
@@ -470,6 +493,7 @@ async function handleGetLogs(env: Env): Promise<Response> {
     let logs: RequestLog[] = []
     let lastRequest = ''
     let lastResponse = ''
+    let lastUserInput = ''
 
     if (env.CONFIG_KV) {
         try {
@@ -487,6 +511,11 @@ async function handleGetLogs(env: Env): Promise<Response> {
             if (responseData) {
                 lastResponse = responseData
             }
+
+            const userInputData = await env.CONFIG_KV.get(KV_LAST_USER_INPUT)
+            if (userInputData) {
+                lastUserInput = userInputData
+            }
         } catch (e) {
             console.error('[Log] Failed to get logs:', e)
         }
@@ -496,7 +525,8 @@ async function handleGetLogs(env: Env): Promise<Response> {
         JSON.stringify({
             logs,
             lastRequest,
-            lastResponse
+            lastResponse,
+            lastUserInput
         }),
         { headers: { 'Content-Type': 'application/json' } }
     )
@@ -718,8 +748,7 @@ async function handleGetProxyConfig(env: Env): Promise<Response> {
             apiKey: proxyConfig.apiKey ? proxyConfig.apiKey.slice(0, 10) + '...' : '',
             apiKeySet: !!proxyConfig.apiKey,
             envBaseUrl: env.CLAUDE_BASE_URL || 'https://api.anthropic.com',
-            envApiKeySet: !!env.CLAUDE_API_KEY,
-            disableSystemField: claude.getDisableSystemField()
+            envApiKeySet: !!env.CLAUDE_API_KEY
         }),
         { headers: { 'Content-Type': 'application/json' } }
     )
@@ -728,7 +757,7 @@ async function handleGetProxyConfig(env: Env): Promise<Response> {
 // 保存代理配置 API
 async function handleSaveProxyConfig(request: Request, env: Env): Promise<Response> {
     try {
-        const body = (await request.json()) as { baseUrl?: string; apiKey?: string; disableSystemField?: boolean }
+        const body = (await request.json()) as { baseUrl?: string; apiKey?: string }
 
         // 获取当前配置
         const currentConfig = await getProxyConfig(env)
@@ -742,12 +771,6 @@ async function handleSaveProxyConfig(request: Request, env: Env): Promise<Respon
         // 保存到 KV
         if (env.CONFIG_KV) {
             await env.CONFIG_KV.put(KV_PROXY_CONFIG, JSON.stringify(newConfig))
-
-            // 保存 disableSystemField 配置（如果提供）
-            if (body.disableSystemField !== undefined) {
-                await env.CONFIG_KV.put(KV_DISABLE_SYSTEM_FIELD, body.disableSystemField.toString())
-                claude.setDisableSystemField(body.disableSystemField)
-            }
         }
 
         // 更新缓存
@@ -757,8 +780,7 @@ async function handleSaveProxyConfig(request: Request, env: Env): Promise<Respon
             JSON.stringify({
                 success: true,
                 baseUrl: newConfig.baseUrl,
-                apiKeySet: !!newConfig.apiKey,
-                disableSystemField: claude.getDisableSystemField()
+                apiKeySet: !!newConfig.apiKey
             }),
             { headers: { 'Content-Type': 'application/json' } }
         )
@@ -1284,15 +1306,6 @@ async function handleConfigPage(env: Env): Promise<Response> {
             <label>API Key（留空则使用环境变量配置）</label>
             <input type="password" id="proxy-api-key" placeholder="输入新的 API Key 或留空保持不变">
         </div>
-        <div style="margin-bottom: 15px; display: flex; align-items: center; gap: 10px;">
-            <input type="checkbox" id="disable-system-field" style="width: auto;">
-            <label for="disable-system-field" style="margin-bottom: 0; cursor: pointer;">
-                禁用独立的 system 字段
-                <span style="color: #888; font-size: 12px; display: block;">
-                    某些代理服务不支持 Claude API 的 system 字段，启用此选项会将 system 消息合并到第一个 user 消息中
-                </span>
-            </label>
-        </div>
         <div class="btn-group">
             <button class="btn-primary" onclick="saveProxyConfig()">保存代理配置</button>
             <button class="btn-outline" onclick="testProxyConnection()">测试连接</button>
@@ -1500,9 +1513,8 @@ async function handleConfigPage(env: Env): Promise<Response> {
 
             const baseUrl = document.getElementById('proxy-base-url').value.trim();
             const apiKey = document.getElementById('proxy-api-key').value.trim();
-            const disableSystemField = document.getElementById('disable-system-field').checked;
 
-            const body = { baseUrl, disableSystemField };
+            const body = { baseUrl };
             if (apiKey) body.apiKey = apiKey;
 
             try {
@@ -1550,23 +1562,9 @@ async function handleConfigPage(env: Env): Promise<Response> {
             }
         }
 
-        // 加载代理配置（包括 disableSystemField）
-        async function loadProxyConfig() {
-            try {
-                const res = await fetch('/api/proxy-config');
-                const data = await res.json();
-                if (data.disableSystemField !== undefined) {
-                    document.getElementById('disable-system-field').checked = data.disableSystemField;
-                }
-            } catch (e) {
-                console.error('Failed to load proxy config:', e);
-            }
-        }
-
         // 页面加载时初始化
         refreshModels();
         loadCurrentMapping();
-        loadProxyConfig();
     </script>
 </body>
 </html>`
@@ -1635,6 +1633,17 @@ async function handleLogsPage(env: Env): Promise<Response> {
         <div id="logsContainer">
             <div class="empty-state">加载中...</div>
         </div>
+    </div>
+
+    <div class="card" style="border: 2px solid #00d4ff;">
+        <div class="header-row">
+            <h2>✏️ 用户最后一次输入</h2>
+            <button class="btn btn-primary btn-sm" id="copyUserInputBtn" onclick="copyUserInput()">一键复制</button>
+        </div>
+        <div class="copy-wrapper">
+            <pre id="lastUserInput" style="max-height: 200px; white-space: pre-wrap;">加载中...</pre>
+        </div>
+        <p style="color: #888; font-size: 12px; margin-top: 10px;">💡 只包含用户在 Cursor 输入框中输入的内容，不含系统消息和上下文</p>
     </div>
 
     <div class="card">
@@ -1706,6 +1715,14 @@ async function handleLogsPage(env: Env): Promise<Response> {
                     container.innerHTML = '<div class="empty-state">暂无请求日志</div>';
                 }
 
+                // 渲染用户最后一次输入
+                const userInputPre = document.getElementById('lastUserInput');
+                if (data.lastUserInput) {
+                    userInputPre.textContent = data.lastUserInput;
+                } else {
+                    userInputPre.textContent = '暂无用户输入记录';
+                }
+
                 // 渲染最近请求
                 const requestPre = document.getElementById('lastRequest');
                 if (data.lastRequest) {
@@ -1726,6 +1743,40 @@ async function handleLogsPage(env: Env): Promise<Response> {
                 console.error('Failed to load logs:', e);
                 document.getElementById('logsContainer').innerHTML =
                     '<div class="empty-state">加载失败: ' + e.message + '</div>';
+            }
+        }
+
+        async function copyUserInput() {
+            const content = document.getElementById('lastUserInput').textContent;
+            if (!content || content === '暂无用户输入记录' || content === '加载中...') {
+                return;
+            }
+
+            try {
+                await navigator.clipboard.writeText(content);
+                const btn = document.getElementById('copyUserInputBtn');
+                btn.textContent = '已复制!';
+                btn.classList.add('copied');
+                setTimeout(() => {
+                    btn.textContent = '一键复制';
+                    btn.classList.remove('copied');
+                }, 2000);
+            } catch (e) {
+                // 降级方案
+                const textarea = document.createElement('textarea');
+                textarea.value = content;
+                document.body.appendChild(textarea);
+                textarea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textarea);
+
+                const btn = document.getElementById('copyUserInputBtn');
+                btn.textContent = '已复制!';
+                btn.classList.add('copied');
+                setTimeout(() => {
+                    btn.textContent = '一键复制';
+                    btn.classList.remove('copied');
+                }, 2000);
             }
         }
 
