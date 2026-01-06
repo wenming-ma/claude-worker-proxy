@@ -11,6 +11,7 @@ const KV_PROXY_CONFIG = 'proxy_config'
 const KV_REQUEST_LOGS = 'request_logs'
 const KV_LAST_REQUEST = 'last_request'
 const KV_LAST_RESPONSE = 'last_response'
+const KV_DISABLE_SYSTEM_FIELD = 'disable_system_field'
 
 // 日志条目类型
 interface RequestLog {
@@ -116,6 +117,13 @@ async function initConfig(env: Env) {
                     apiKey: config.apiKey || env.CLAUDE_API_KEY || ''
                 }
                 console.log('[Init] Loaded proxy config from KV')
+            }
+
+            // 加载是否禁用 system 字段的配置
+            const disableSystemField = await env.CONFIG_KV.get(KV_DISABLE_SYSTEM_FIELD)
+            if (disableSystemField) {
+                claude.setDisableSystemField(disableSystemField === 'true')
+                console.log('[Init] Loaded disableSystemField from KV:', disableSystemField)
             }
         }
     } catch (e) {
@@ -710,7 +718,8 @@ async function handleGetProxyConfig(env: Env): Promise<Response> {
             apiKey: proxyConfig.apiKey ? proxyConfig.apiKey.slice(0, 10) + '...' : '',
             apiKeySet: !!proxyConfig.apiKey,
             envBaseUrl: env.CLAUDE_BASE_URL || 'https://api.anthropic.com',
-            envApiKeySet: !!env.CLAUDE_API_KEY
+            envApiKeySet: !!env.CLAUDE_API_KEY,
+            disableSystemField: claude.getDisableSystemField()
         }),
         { headers: { 'Content-Type': 'application/json' } }
     )
@@ -719,7 +728,7 @@ async function handleGetProxyConfig(env: Env): Promise<Response> {
 // 保存代理配置 API
 async function handleSaveProxyConfig(request: Request, env: Env): Promise<Response> {
     try {
-        const body = (await request.json()) as { baseUrl?: string; apiKey?: string }
+        const body = (await request.json()) as { baseUrl?: string; apiKey?: string; disableSystemField?: boolean }
 
         // 获取当前配置
         const currentConfig = await getProxyConfig(env)
@@ -733,6 +742,12 @@ async function handleSaveProxyConfig(request: Request, env: Env): Promise<Respon
         // 保存到 KV
         if (env.CONFIG_KV) {
             await env.CONFIG_KV.put(KV_PROXY_CONFIG, JSON.stringify(newConfig))
+
+            // 保存 disableSystemField 配置（如果提供）
+            if (body.disableSystemField !== undefined) {
+                await env.CONFIG_KV.put(KV_DISABLE_SYSTEM_FIELD, body.disableSystemField.toString())
+                claude.setDisableSystemField(body.disableSystemField)
+            }
         }
 
         // 更新缓存
@@ -742,7 +757,8 @@ async function handleSaveProxyConfig(request: Request, env: Env): Promise<Respon
             JSON.stringify({
                 success: true,
                 baseUrl: newConfig.baseUrl,
-                apiKeySet: !!newConfig.apiKey
+                apiKeySet: !!newConfig.apiKey,
+                disableSystemField: claude.getDisableSystemField()
             }),
             { headers: { 'Content-Type': 'application/json' } }
         )
@@ -1268,6 +1284,15 @@ async function handleConfigPage(env: Env): Promise<Response> {
             <label>API Key（留空则使用环境变量配置）</label>
             <input type="password" id="proxy-api-key" placeholder="输入新的 API Key 或留空保持不变">
         </div>
+        <div style="margin-bottom: 15px; display: flex; align-items: center; gap: 10px;">
+            <input type="checkbox" id="disable-system-field" style="width: auto;">
+            <label for="disable-system-field" style="margin-bottom: 0; cursor: pointer;">
+                禁用独立的 system 字段
+                <span style="color: #888; font-size: 12px; display: block;">
+                    某些代理服务（如 crs.itssx.com）不支持 Claude API 的 system 字段，启用此选项会将 system 消息合并到第一个 user 消息中
+                </span>
+            </label>
+        </div>
         <div class="btn-group">
             <button class="btn-primary" onclick="saveProxyConfig()">保存代理配置</button>
             <button class="btn-outline" onclick="testProxyConnection()">测试连接</button>
@@ -1475,8 +1500,9 @@ async function handleConfigPage(env: Env): Promise<Response> {
 
             const baseUrl = document.getElementById('proxy-base-url').value.trim();
             const apiKey = document.getElementById('proxy-api-key').value.trim();
+            const disableSystemField = document.getElementById('disable-system-field').checked;
 
-            const body = { baseUrl };
+            const body = { baseUrl, disableSystemField };
             if (apiKey) body.apiKey = apiKey;
 
             try {
@@ -1524,9 +1550,23 @@ async function handleConfigPage(env: Env): Promise<Response> {
             }
         }
 
+        // 加载代理配置（包括 disableSystemField）
+        async function loadProxyConfig() {
+            try {
+                const res = await fetch('/api/proxy-config');
+                const data = await res.json();
+                if (data.disableSystemField !== undefined) {
+                    document.getElementById('disable-system-field').checked = data.disableSystemField;
+                }
+            } catch (e) {
+                console.error('Failed to load proxy config:', e);
+            }
+        }
+
         // 页面加载时初始化
         refreshModels();
         loadCurrentMapping();
+        loadProxyConfig();
     </script>
 </body>
 </html>`
