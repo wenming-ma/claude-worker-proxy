@@ -1289,7 +1289,7 @@ async function handleConfigPage(env: Env): Promise<Response> {
             <label for="disable-system-field" style="margin-bottom: 0; cursor: pointer;">
                 禁用独立的 system 字段
                 <span style="color: #888; font-size: 12px; display: block;">
-                    某些代理服务（如 crs.itssx.com）不支持 Claude API 的 system 字段，启用此选项会将 system 消息合并到第一个 user 消息中
+                    某些代理服务不支持 Claude API 的 system 字段，启用此选项会将 system 消息合并到第一个 user 消息中
                 </span>
             </label>
         </div>
