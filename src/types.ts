@@ -34,13 +34,21 @@ export interface ClaudeRequest {
     stream?: boolean
     tools?: ClaudeTool[]
     system?: string
+    thinking?: {
+        type: 'enabled' | 'disabled'
+        budget_tokens?: number
+    }
 }
 
 export interface ClaudeResponse {
     id: string
     type: 'message'
     role: 'assistant'
-    content: Array<{ type: 'text'; text: string } | { type: 'tool_use'; id: string; name: string; input: any }>
+    content: Array<
+        | { type: 'text'; text: string }
+        | { type: 'tool_use'; id: string; name: string; input: any }
+        | { type: 'thinking'; thinking: string; signature?: string }
+    >
     stop_reason?: 'end_turn' | 'tool_use' | 'max_tokens'
     usage?: {
         input_tokens: number
@@ -105,16 +113,18 @@ export interface ClaudeStreamEvent {
         | 'message_stop'
     message?: Partial<ClaudeResponse>
     content_block?: {
-        type: 'text' | 'tool_use'
+        type: 'text' | 'tool_use' | 'thinking'
         text?: string
         id?: string
         name?: string
         input?: any
+        thinking?: string
     }
     delta?: {
-        type: 'text_delta' | 'input_json_delta'
+        type: 'text_delta' | 'input_json_delta' | 'thinking_delta'
         text?: string
         partial_json?: string
+        thinking?: string
     }
     index?: number
     usage?: {

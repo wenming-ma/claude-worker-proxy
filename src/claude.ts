@@ -4,7 +4,7 @@ import * as utils from './utils'
 
 // 默认模型名称映射表（作为后备）
 export const DEFAULT_MODEL_MAPPING: { [key: string]: string } = {
-    // Cursor 配置的模型名
+    // Cursor 配置的模型名（思考模型）
     'tinyy-model': 'claude-sonnet-4-5-20250929',
     'bigger-model': 'claude-opus-4-5-20251101',
 
@@ -14,6 +14,9 @@ export const DEFAULT_MODEL_MAPPING: { [key: string]: string } = {
     'gpt-4-turbo': 'claude-sonnet-4-5-20250929',
     'gpt-3.5-turbo': 'claude-haiku-4-5-20251001'
 }
+
+// 需要启用思考模式的模型别名
+const THINKING_MODELS = new Set(['tinyy-model', 'bigger-model'])
 
 // 当前使用的模型映射（可动态更新）
 let currentModelMapping: { [key: string]: string } = { ...DEFAULT_MODEL_MAPPING }
@@ -45,11 +48,25 @@ export class ClaudeProvider implements provider.Provider {
         // 应用模型名称映射
         const mappedModel = mapModelName(openaiRequest.model)
 
+        // 检查是否需要启用思考模式
+        const enableThinking = THINKING_MODELS.has(openaiRequest.model)
+
         const claudeRequest: types.ClaudeRequest = {
             model: mappedModel,
             messages,
-            max_tokens: openaiRequest.max_tokens || 4096,
+            // 思考模式需要更大的 max_tokens
+            max_tokens: enableThinking
+                ? Math.max(openaiRequest.max_tokens || 16000, 16000)
+                : openaiRequest.max_tokens || 4096,
             stream: openaiRequest.stream
+        }
+
+        // 为思考模型启用 thinking 参数
+        if (enableThinking) {
+            claudeRequest.thinking = {
+                type: 'enabled',
+                budget_tokens: 10000
+            }
         }
 
         if (system) {
@@ -247,6 +264,8 @@ export class ClaudeProvider implements provider.Provider {
                     }
                 })
             }
+            // 跳过 thinking 块，不包含在最终输出中（思考过程对用户不可见）
+            // else if (content.type === 'thinking') { ... }
         }
 
         if (textContent) {
