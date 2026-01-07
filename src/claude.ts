@@ -270,11 +270,15 @@ export class ClaudeProvider implements provider.Provider {
         }
 
         let textContent = ''
+        let thinkingContent = ''
         const toolCalls: types.OpenAIToolCall[] = []
 
         for (const content of claudeData.content) {
             if (content.type === 'text') {
                 textContent += content.text
+            } else if (content.type === 'thinking') {
+                // 收集 thinking 内容
+                thinkingContent += content.thinking
             } else if (content.type === 'tool_use') {
                 toolCalls.push({
                     id: content.id,
@@ -285,8 +289,11 @@ export class ClaudeProvider implements provider.Provider {
                     }
                 })
             }
-            // 跳过 thinking 块，不包含在最终输出中（思考过程对用户不可见）
-            // else if (content.type === 'thinking') { ... }
+        }
+
+        // 如果有 thinking 内容，将其放在回答前面
+        if (thinkingContent) {
+            textContent = `<thinking>\n${thinkingContent}\n</thinking>\n\n${textContent}`
         }
 
         if (textContent) {
@@ -319,6 +326,7 @@ export class ClaudeProvider implements provider.Provider {
                 let model = 'claude'
                 let isFirstChunk = true
                 let textContent = ''
+                let inThinkingBlock = false
                 const toolCalls: Array<{
                     index: number
                     id: string
@@ -376,6 +384,23 @@ export class ClaudeProvider implements provider.Provider {
                                             }
                                         }
                                         toolCalls.push(toolCall)
+                                    } else if (event.content_block?.type === 'thinking') {
+                                        // 开始 thinking 块，发送开始标签
+                                        inThinkingBlock = true
+                                        const openaiChunk: types.OpenAIStreamResponse = {
+                                            id: responseId,
+                                            object: 'chat.completion.chunk',
+                                            created: Math.floor(Date.now() / 1000),
+                                            model,
+                                            choices: [
+                                                {
+                                                    index: 0,
+                                                    delta: { content: '<thinking>\n' },
+                                                    finish_reason: null
+                                                }
+                                            ]
+                                        }
+                                        controller.enqueue(encoder.encode(`data: ${JSON.stringify(openaiChunk)}\n\n`))
                                     }
                                 } else if (event.type === 'content_block_delta') {
                                     if (event.delta?.type === 'text_delta' && event.delta.text) {
@@ -395,6 +420,22 @@ export class ClaudeProvider implements provider.Provider {
                                             ]
                                         }
                                         controller.enqueue(encoder.encode(`data: ${JSON.stringify(openaiChunk)}\n\n`))
+                                    } else if (event.delta?.type === 'thinking_delta' && event.delta.thinking) {
+                                        // thinking 内容流式输出
+                                        const openaiChunk: types.OpenAIStreamResponse = {
+                                            id: responseId,
+                                            object: 'chat.completion.chunk',
+                                            created: Math.floor(Date.now() / 1000),
+                                            model,
+                                            choices: [
+                                                {
+                                                    index: 0,
+                                                    delta: { content: event.delta.thinking },
+                                                    finish_reason: null
+                                                }
+                                            ]
+                                        }
+                                        controller.enqueue(encoder.encode(`data: ${JSON.stringify(openaiChunk)}\n\n`))
                                     } else if (event.delta?.type === 'input_json_delta' && event.delta.partial_json) {
                                         // 工具调用参数
                                         if (toolCalls.length > 0) {
@@ -403,6 +444,24 @@ export class ClaudeProvider implements provider.Provider {
                                         }
                                     }
                                 } else if (event.type === 'content_block_stop') {
+                                    // 如果在 thinking 块中，发送结束标签
+                                    if (inThinkingBlock) {
+                                        inThinkingBlock = false
+                                        const openaiChunk: types.OpenAIStreamResponse = {
+                                            id: responseId,
+                                            object: 'chat.completion.chunk',
+                                            created: Math.floor(Date.now() / 1000),
+                                            model,
+                                            choices: [
+                                                {
+                                                    index: 0,
+                                                    delta: { content: '\n</thinking>\n\n' },
+                                                    finish_reason: null
+                                                }
+                                            ]
+                                        }
+                                        controller.enqueue(encoder.encode(`data: ${JSON.stringify(openaiChunk)}\n\n`))
+                                    }
                                     // 如果有工具调用，发送它
                                     if (toolCalls.length > 0) {
                                         const lastToolCall = toolCalls[toolCalls.length - 1]
