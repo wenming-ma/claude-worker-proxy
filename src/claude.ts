@@ -43,7 +43,8 @@ function mapModelName(inputModel: string): string {
 export class ClaudeProvider implements provider.Provider {
     async convertToProviderRequest(request: Request, baseUrl: string, apiKey: string): Promise<Request> {
         const openaiRequest = (await request.json()) as types.OpenAIRequest
-        const { messages, system } = this.convertMessages(openaiRequest.messages)
+        // system 消息已在 convertMessages 中合并到第一个 user 消息，不再单独使用
+        const { messages } = this.convertMessages(openaiRequest.messages)
 
         // 应用模型名称映射
         const mappedModel = mapModelName(openaiRequest.model)
@@ -69,9 +70,8 @@ export class ClaudeProvider implements provider.Provider {
             }
         }
 
-        if (system) {
-            claudeRequest.system = system
-        }
+        // 注意：不再使用顶级 system 字段，因为某些代理服务不支持（如 crs.itssx.com）
+        // system 消息已在 convertMessages 中合并到第一个 user 消息中
 
         if (openaiRequest.temperature !== undefined) {
             claudeRequest.temperature = openaiRequest.temperature
@@ -214,9 +214,30 @@ export class ClaudeProvider implements provider.Provider {
             }
         }
 
+        // 如果有 system 消息，将其合并到第一个 user 消息中
+        // 这是为了兼容不支持顶级 system 字段的代理服务（如 crs.itssx.com）
+        const systemPrompt = systemMessages.length > 0 ? systemMessages.join('\n\n') : undefined
+        if (systemPrompt && claudeMessages.length > 0) {
+            const firstUserIndex = claudeMessages.findIndex(m => m.role === 'user')
+            if (firstUserIndex !== -1) {
+                const firstUserMsg = claudeMessages[firstUserIndex]
+                if (typeof firstUserMsg.content === 'string') {
+                    // 将 system 消息前置到第一个 user 消息
+                    firstUserMsg.content = `[System Instructions]\n${systemPrompt}\n\n[User Message]\n${firstUserMsg.content}`
+                } else if (Array.isArray(firstUserMsg.content)) {
+                    // 对于数组格式的内容，在开头插入 system 文本
+                    firstUserMsg.content.unshift({
+                        type: 'text',
+                        text: `[System Instructions]\n${systemPrompt}\n\n[User Message]`
+                    })
+                }
+            }
+        }
+
         return {
             messages: claudeMessages,
-            system: systemMessages.length > 0 ? systemMessages.join('\n\n') : undefined
+            // 不再返回顶级 system 字段，因为某些代理不支持
+            system: undefined
         }
     }
 
