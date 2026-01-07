@@ -73,9 +73,9 @@ export class ClaudeProvider implements provider.Provider {
         // 注意：不再使用顶级 system 字段，因为某些代理服务不支持（如 crs.itssx.com）
         // system 消息已在 convertMessages 中合并到第一个 user 消息中
 
-        if (openaiRequest.temperature !== undefined) {
-            claudeRequest.temperature = openaiRequest.temperature
-        }
+        // 注意：不传递 temperature 参数，因为某些代理服务（如 imds.ai）
+        // 在 temperature != 1 时会返回 502 错误
+        // Claude 默认使用合适的 temperature，所以不传递也没问题
 
         if (openaiRequest.tools && openaiRequest.tools.length > 0) {
             claudeRequest.tools = openaiRequest.tools.map(tool => ({
