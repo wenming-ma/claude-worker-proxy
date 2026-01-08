@@ -3,6 +3,11 @@ import * as gemini from './gemini'
 import * as openai from './openai'
 import * as claude from './claude'
 
+// 重试配置
+const RETRY_STATUS_CODES = [502, 503, 504] // 需要重试的状态码
+const MAX_RETRIES = 10 // 最大重试次数
+const RETRY_DELAY_MS = 1000 // 重试间隔（毫秒）
+
 // KV 键名
 const KV_MODEL_MAPPING = 'model_mapping'
 const KV_AVAILABLE_MODELS = 'available_models'
@@ -122,6 +127,56 @@ async function initConfig(env: Env) {
     } catch (e) {
         console.error('[Init] Failed to load config from KV:', e)
     }
+}
+
+// 带重试的 fetch 函数
+async function fetchWithRetry(request: Request, requestId: string): Promise<Response> {
+    let lastError: Error | null = null
+    let lastResponse: Response | null = null
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            // 每次重试需要克隆请求，因为 body 只能读取一次
+            const reqClone = request.clone()
+            const response = await fetch(reqClone)
+
+            // 如果是可重试的状态码，继续重试
+            if (RETRY_STATUS_CODES.includes(response.status) && attempt < MAX_RETRIES) {
+                console.log(
+                    `[${requestId}] Attempt ${attempt}/${MAX_RETRIES} got ${response.status}, retrying in ${RETRY_DELAY_MS}ms...`
+                )
+                lastResponse = response
+                await sleep(RETRY_DELAY_MS)
+                continue
+            }
+
+            // 成功或不可重试的错误，直接返回
+            if (attempt > 1) {
+                console.log(`[${requestId}] Attempt ${attempt}/${MAX_RETRIES} succeeded with status ${response.status}`)
+            }
+            return response
+        } catch (error) {
+            lastError = error instanceof Error ? error : new Error(String(error))
+            console.error(`[${requestId}] Attempt ${attempt}/${MAX_RETRIES} failed:`, lastError.message)
+
+            if (attempt < MAX_RETRIES) {
+                await sleep(RETRY_DELAY_MS)
+            }
+        }
+    }
+
+    // 所有重试都失败了
+    if (lastResponse) {
+        console.error(`[${requestId}] All ${MAX_RETRIES} retries exhausted, returning last response`)
+        return lastResponse
+    }
+
+    throw lastError || new Error('All retries failed')
+}
+
+// 延迟函数
+function sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms))
 }
 
 async function handle(request: Request, env: Env, requestId: string, ctx: ExecutionContext): Promise<Response> {
@@ -311,7 +366,7 @@ async function handleOpenAIToClaude(
         console.log(`[${requestId}] Claude request model: ${claudeBody.model}`)
         console.log(`[${requestId}] Claude request URL: ${claudeRequest.url}`)
 
-        const claudeResponse = await fetch(claudeRequest)
+        const claudeResponse = await fetchWithRetry(claudeRequest, requestId)
         console.log(`[${requestId}] Claude response status: ${claudeResponse.status}`)
 
         if (!claudeResponse.ok) {
@@ -1859,6 +1914,7 @@ async function handleLogsPage(env: Env): Promise<Response> {
 }
 
 async function handleTestEndpoint(env: Env): Promise<Response> {
+    const requestId = 'test-' + crypto.randomUUID().slice(0, 8)
     const testRequest = {
         model: 'tinyy-model',
         messages: [{ role: 'user', content: 'Say "test ok" in 2 words' }],
@@ -1904,7 +1960,7 @@ async function handleTestEndpoint(env: Env): Promise<Response> {
         // Step 2: 发送请求
         results.steps.push({ step: 2, name: 'Send to Claude API', status: 'started' })
         const startTime = Date.now()
-        const claudeResponse = await fetch(claudeRequest)
+        const claudeResponse = await fetchWithRetry(claudeRequest, requestId)
         const duration = Date.now() - startTime
 
         results.steps[1].status = claudeResponse.ok ? 'success' : 'failed'
