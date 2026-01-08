@@ -88,11 +88,19 @@ const KV_MODEL_MAPPING = 'model_mapping'
 const KV_OPENAI_MODEL_MAPPING = 'openai_model_mapping'
 const KV_AVAILABLE_MODELS = 'available_models'
 const KV_LAST_REFRESH = 'last_refresh'
-const KV_PROXY_CONFIG = 'proxy_config'
+const KV_CLAUDE_PROXY_CONFIG = 'claude_proxy_config'  // Claude 代理配置
+const KV_OPENAI_PROXY_CONFIG = 'openai_proxy_config'  // OpenAI 代理配置
+const KV_ACTIVE_PROXY_TYPE = 'active_proxy_type'      // 当前激活的代理类型
 const KV_REQUEST_LOGS = 'request_logs'
 const KV_LAST_REQUEST = 'last_request'
 const KV_LAST_RESPONSE = 'last_response'
 const KV_LAST_USER_INPUT = 'last_user_input'
+
+// 代理配置接口
+interface ProxyConfig {
+    baseUrl: string
+    apiKey: string
+}
 
 // 日志条目类型
 interface RequestLog {
@@ -108,8 +116,10 @@ interface RequestLog {
     error?: string
 }
 
-// 代理配置缓存
-let cachedProxyConfig: { baseUrl: string; apiKey: string; type: ProxyType } | null = null
+// 分离的代理配置缓存
+let cachedClaudeProxyConfig: ProxyConfig | null = null
+let cachedOpenAIProxyConfig: ProxyConfig | null = null
+let cachedActiveProxyType: ProxyType = 'claude'
 
 export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -146,37 +156,82 @@ export default {
     }
 } satisfies ExportedHandler<Env>
 
-// 获取代理配置（优先从 KV，否则从环境变量）
-async function getProxyConfig(env: Env): Promise<{ baseUrl: string; apiKey: string; type: ProxyType }> {
-    // 如果有缓存，直接返回
-    if (cachedProxyConfig) {
-        return cachedProxyConfig
+// 获取当前激活的代理类型
+function getActiveProxyType(): ProxyType {
+    return cachedActiveProxyType
+}
+
+// 设置当前激活的代理类型
+async function setActiveProxyType(env: Env, type: ProxyType): Promise<void> {
+    cachedActiveProxyType = type
+    if (env.CONFIG_KV) {
+        await env.CONFIG_KV.put(KV_ACTIVE_PROXY_TYPE, type)
+    }
+}
+
+// 获取 Claude 代理配置
+async function getClaudeProxyConfig(env: Env): Promise<ProxyConfig> {
+    if (cachedClaudeProxyConfig) {
+        return cachedClaudeProxyConfig
     }
 
     try {
         if (env.CONFIG_KV) {
-            const savedConfig = await env.CONFIG_KV.get(KV_PROXY_CONFIG)
+            const savedConfig = await env.CONFIG_KV.get(KV_CLAUDE_PROXY_CONFIG)
             if (savedConfig) {
-                const config = JSON.parse(savedConfig)
-                cachedProxyConfig = {
-                    baseUrl: config.baseUrl || env.CLAUDE_BASE_URL || 'https://api.anthropic.com',
-                    apiKey: config.apiKey || env.CLAUDE_API_KEY || '',
-                    type: config.type || 'claude'
-                }
-                return cachedProxyConfig
+                cachedClaudeProxyConfig = JSON.parse(savedConfig)
+                return cachedClaudeProxyConfig!
             }
         }
     } catch (e) {
-        console.error('[Config] Failed to load proxy config from KV:', e)
+        console.error('[Config] Failed to load Claude proxy config from KV:', e)
     }
 
     // 使用环境变量作为后备
-    cachedProxyConfig = {
+    cachedClaudeProxyConfig = {
         baseUrl: env.CLAUDE_BASE_URL || 'https://api.anthropic.com',
-        apiKey: env.CLAUDE_API_KEY || '',
-        type: 'claude'
+        apiKey: env.CLAUDE_API_KEY || ''
     }
-    return cachedProxyConfig
+    return cachedClaudeProxyConfig
+}
+
+// 获取 OpenAI 代理配置
+async function getOpenAIProxyConfig(env: Env): Promise<ProxyConfig> {
+    if (cachedOpenAIProxyConfig) {
+        return cachedOpenAIProxyConfig
+    }
+
+    try {
+        if (env.CONFIG_KV) {
+            const savedConfig = await env.CONFIG_KV.get(KV_OPENAI_PROXY_CONFIG)
+            if (savedConfig) {
+                cachedOpenAIProxyConfig = JSON.parse(savedConfig)
+                return cachedOpenAIProxyConfig!
+            }
+        }
+    } catch (e) {
+        console.error('[Config] Failed to load OpenAI proxy config from KV:', e)
+    }
+
+    // OpenAI 默认配置
+    cachedOpenAIProxyConfig = {
+        baseUrl: 'https://api.openai.com',
+        apiKey: ''
+    }
+    return cachedOpenAIProxyConfig
+}
+
+// 获取当前激活的代理配置（根据类型返回对应配置）
+async function getProxyConfig(env: Env): Promise<{ baseUrl: string; apiKey: string; type: ProxyType }> {
+    const proxyType = getActiveProxyType()
+
+    if (proxyType === 'openai') {
+        const config = await getOpenAIProxyConfig(env)
+        return { ...config, type: 'openai' }
+    } else {
+        const config = await getClaudeProxyConfig(env)
+        return { ...config, type: 'claude' }
+    }
 }
 
 // 初始化配置（从 KV 加载模型映射和代理配置）
@@ -199,16 +254,25 @@ async function initConfig(env: Env) {
                 console.log('[Init] Loaded OpenAI model mapping from KV')
             }
 
-            // 加载代理配置
-            const savedConfig = await env.CONFIG_KV.get(KV_PROXY_CONFIG)
-            if (savedConfig) {
-                const config = JSON.parse(savedConfig)
-                cachedProxyConfig = {
-                    baseUrl: config.baseUrl || env.CLAUDE_BASE_URL || 'https://api.anthropic.com',
-                    apiKey: config.apiKey || env.CLAUDE_API_KEY || '',
-                    type: config.type || 'claude'
-                }
-                console.log('[Init] Loaded proxy config from KV, type:', cachedProxyConfig.type)
+            // 加载当前激活的代理类型
+            const savedType = await env.CONFIG_KV.get(KV_ACTIVE_PROXY_TYPE)
+            if (savedType) {
+                cachedActiveProxyType = savedType as ProxyType
+                console.log('[Init] Loaded active proxy type from KV:', cachedActiveProxyType)
+            }
+
+            // 加载 Claude 代理配置
+            const savedClaudeConfig = await env.CONFIG_KV.get(KV_CLAUDE_PROXY_CONFIG)
+            if (savedClaudeConfig) {
+                cachedClaudeProxyConfig = JSON.parse(savedClaudeConfig)
+                console.log('[Init] Loaded Claude proxy config from KV')
+            }
+
+            // 加载 OpenAI 代理配置
+            const savedOpenAIConfig = await env.CONFIG_KV.get(KV_OPENAI_PROXY_CONFIG)
+            if (savedOpenAIConfig) {
+                cachedOpenAIProxyConfig = JSON.parse(savedOpenAIConfig)
+                console.log('[Init] Loaded OpenAI proxy config from KV')
             }
         }
     } catch (e) {
@@ -1235,16 +1299,25 @@ async function autoDetectOpenAI(env: Env, baseUrl: string, apiKey: string): Prom
     }
 }
 
-// 获取代理配置 API
+// 获取代理配置 API（返回两种代理的配置）
 async function handleGetProxyConfig(env: Env): Promise<Response> {
-    const proxyConfig = await getProxyConfig(env)
+    const claudeConfig = await getClaudeProxyConfig(env)
+    const openaiConfig = await getOpenAIProxyConfig(env)
+    const activeType = getActiveProxyType()
 
     return new Response(
         JSON.stringify({
-            baseUrl: proxyConfig.baseUrl,
-            apiKey: proxyConfig.apiKey ? proxyConfig.apiKey.slice(0, 10) + '...' : '',
-            apiKeySet: !!proxyConfig.apiKey,
-            type: proxyConfig.type,
+            activeType,
+            claude: {
+                baseUrl: claudeConfig.baseUrl,
+                apiKey: claudeConfig.apiKey ? claudeConfig.apiKey.slice(0, 10) + '...' : '',
+                apiKeySet: !!claudeConfig.apiKey
+            },
+            openai: {
+                baseUrl: openaiConfig.baseUrl,
+                apiKey: openaiConfig.apiKey ? openaiConfig.apiKey.slice(0, 10) + '...' : '',
+                apiKeySet: !!openaiConfig.apiKey
+            },
             envBaseUrl: env.CLAUDE_BASE_URL || 'https://api.anthropic.com',
             envApiKeySet: !!env.CLAUDE_API_KEY
         }),
@@ -1252,35 +1325,58 @@ async function handleGetProxyConfig(env: Env): Promise<Response> {
     )
 }
 
-// 保存代理配置 API
+// 保存代理配置 API（分别保存两种代理的配置）
 async function handleSaveProxyConfig(request: Request, env: Env): Promise<Response> {
     try {
-        const body = (await request.json()) as { baseUrl?: string; apiKey?: string; type?: ProxyType }
-
-        // 获取当前配置
-        const currentConfig = await getProxyConfig(env)
-
-        // 更新配置
-        const newConfig = {
-            baseUrl: body.baseUrl || currentConfig.baseUrl,
-            apiKey: body.apiKey || currentConfig.apiKey,
-            type: body.type || currentConfig.type
+        const body = (await request.json()) as {
+            activeType?: ProxyType
+            claude?: { baseUrl?: string; apiKey?: string }
+            openai?: { baseUrl?: string; apiKey?: string }
         }
 
-        // 保存到 KV
-        if (env.CONFIG_KV) {
-            await env.CONFIG_KV.put(KV_PROXY_CONFIG, JSON.stringify(newConfig))
+        // 更新激活的代理类型
+        if (body.activeType) {
+            await setActiveProxyType(env, body.activeType)
         }
 
-        // 更新缓存
-        cachedProxyConfig = newConfig
+        // 更新 Claude 代理配置
+        if (body.claude) {
+            const currentClaudeConfig = await getClaudeProxyConfig(env)
+            const newClaudeConfig: ProxyConfig = {
+                baseUrl: body.claude.baseUrl || currentClaudeConfig.baseUrl,
+                apiKey: body.claude.apiKey !== undefined ? body.claude.apiKey : currentClaudeConfig.apiKey
+            }
+            cachedClaudeProxyConfig = newClaudeConfig
+            if (env.CONFIG_KV) {
+                await env.CONFIG_KV.put(KV_CLAUDE_PROXY_CONFIG, JSON.stringify(newClaudeConfig))
+            }
+        }
+
+        // 更新 OpenAI 代理配置
+        if (body.openai) {
+            const currentOpenAIConfig = await getOpenAIProxyConfig(env)
+            const newOpenAIConfig: ProxyConfig = {
+                baseUrl: body.openai.baseUrl || currentOpenAIConfig.baseUrl,
+                apiKey: body.openai.apiKey !== undefined ? body.openai.apiKey : currentOpenAIConfig.apiKey
+            }
+            cachedOpenAIProxyConfig = newOpenAIConfig
+            if (env.CONFIG_KV) {
+                await env.CONFIG_KV.put(KV_OPENAI_PROXY_CONFIG, JSON.stringify(newOpenAIConfig))
+            }
+        }
 
         return new Response(
             JSON.stringify({
                 success: true,
-                baseUrl: newConfig.baseUrl,
-                apiKeySet: !!newConfig.apiKey,
-                type: newConfig.type
+                activeType: getActiveProxyType(),
+                claude: {
+                    baseUrl: cachedClaudeProxyConfig?.baseUrl,
+                    apiKeySet: !!cachedClaudeProxyConfig?.apiKey
+                },
+                openai: {
+                    baseUrl: cachedOpenAIProxyConfig?.baseUrl,
+                    apiKeySet: !!cachedOpenAIProxyConfig?.apiKey
+                }
             }),
             { headers: { 'Content-Type': 'application/json' } }
         )
@@ -1740,7 +1836,9 @@ async function handleChatPage(env: Env): Promise<Response> {
 async function handleConfigPage(env: Env): Promise<Response> {
     const currentMapping = claude.getModelMapping()
     const mappingJson = JSON.stringify(currentMapping, null, 2)
-    const proxyConfig = await getProxyConfig(env)
+    const claudeConfig = await getClaudeProxyConfig(env)
+    const openaiConfig = await getOpenAIProxyConfig(env)
+    const activeType = getActiveProxyType()
 
     const html = `<!DOCTYPE html>
 <html>
@@ -1752,7 +1850,9 @@ async function handleConfigPage(env: Env): Promise<Response> {
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; background: #1a1a2e; color: #eee; }
         h1 { color: #00d4ff; margin-bottom: 30px; }
         h2 { color: #00d4ff; font-size: 18px; margin-top: 0; }
+        h3 { color: #aaa; font-size: 14px; margin: 15px 0 10px 0; }
         .card { background: #16213e; border-radius: 12px; padding: 24px; margin: 20px 0; }
+        .card.active { border: 2px solid #00d4ff; }
         .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
         @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }
         label { display: block; margin-bottom: 8px; color: #aaa; font-size: 14px; }
@@ -1765,7 +1865,9 @@ async function handleConfigPage(env: Env): Promise<Response> {
         .btn-secondary:hover { background: #d63850; }
         .btn-outline { background: transparent; border: 1px solid #00d4ff; color: #00d4ff; }
         .btn-outline:hover { background: #00d4ff22; }
-        .btn-group { display: flex; gap: 10px; margin-top: 20px; }
+        .btn-green { background: #00ff88; color: #000; }
+        .btn-green:hover { background: #00cc6a; }
+        .btn-group { display: flex; gap: 10px; margin-top: 20px; flex-wrap: wrap; }
         .model-list { max-height: 300px; overflow-y: auto; background: #0f3460; border-radius: 8px; padding: 15px; }
         .model-item { padding: 8px 12px; margin: 4px 0; background: #16213e; border-radius: 6px; font-family: monospace; font-size: 13px; }
         .model-item.sonnet { border-left: 3px solid #00d4ff; }
@@ -1784,6 +1886,9 @@ async function handleConfigPage(env: Env): Promise<Response> {
         a:hover { text-decoration: underline; }
         .nav { margin-bottom: 30px; }
         .nav a { margin-right: 20px; }
+        .type-badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; margin-left: 10px; }
+        .type-badge.active { background: #00ff88; color: #000; }
+        .type-badge.inactive { background: #444; color: #888; }
     </style>
 </head>
 <body>
@@ -1796,31 +1901,47 @@ async function handleConfigPage(env: Env): Promise<Response> {
 
     <h1>⚙️ 代理配置</h1>
 
-    <div class="card">
-        <h2>🔌 代理服务设置</h2>
-        <div style="margin-bottom: 15px;">
-            <label>代理类型</label>
-            <select id="proxy-type" style="width: 100%; padding: 12px; border: 1px solid #0f3460; border-radius: 8px; background: #0f3460; color: #fff; font-size: 14px;">
-                <option value="claude" ${proxyConfig.type === 'claude' ? 'selected' : ''}>Claude API（OpenAI 格式 → Claude）</option>
-                <option value="openai" ${proxyConfig.type === 'openai' ? 'selected' : ''}>OpenAI API（直接转发）</option>
-            </select>
+    <div class="grid">
+        <div class="card ${activeType === 'claude' ? 'active' : ''}" id="claude-card">
+            <h2>🟣 Claude 代理 <span class="type-badge ${activeType === 'claude' ? 'active' : 'inactive'}">${activeType === 'claude' ? '当前激活' : '未激活'}</span></h2>
+            <p style="color: #888; font-size: 13px; margin-bottom: 15px;">OpenAI 格式请求 → Claude API 转换</p>
+            <div style="margin-bottom: 15px;">
+                <label>Base URL</label>
+                <input type="text" id="claude-base-url" placeholder="https://api.anthropic.com" value="${claudeConfig.baseUrl}">
+            </div>
+            <div style="margin-bottom: 15px;">
+                <label>API Key</label>
+                <input type="password" id="claude-api-key" placeholder="输入新的 API Key 或留空保持不变">
+                <small style="color: #666;">${claudeConfig.apiKey ? '已配置: ' + claudeConfig.apiKey.slice(0, 10) + '...' : '未配置'}</small>
+            </div>
+            <div class="btn-group">
+                <button class="btn-primary" onclick="saveClaudeConfig()">保存配置</button>
+                <button class="btn-green" onclick="activateProxy('claude')">激活此代理</button>
+            </div>
+            <div id="claudeStatus"></div>
         </div>
-        <div style="margin-bottom: 15px;">
-            <label>API Base URL</label>
-            <input type="text" id="proxy-base-url" placeholder="https://api.anthropic.com 或 https://api.openai.com" value="${proxyConfig.baseUrl}">
+
+        <div class="card ${activeType === 'openai' ? 'active' : ''}" id="openai-card">
+            <h2>🟢 OpenAI 代理 <span class="type-badge ${activeType === 'openai' ? 'active' : 'inactive'}">${activeType === 'openai' ? '当前激活' : '未激活'}</span></h2>
+            <p style="color: #888; font-size: 13px; margin-bottom: 15px;">OpenAI 格式请求 → 直接转发到 OpenAI API</p>
+            <div style="margin-bottom: 15px;">
+                <label>Base URL</label>
+                <input type="text" id="openai-base-url" placeholder="https://api.openai.com" value="${openaiConfig.baseUrl}">
+            </div>
+            <div style="margin-bottom: 15px;">
+                <label>API Key</label>
+                <input type="password" id="openai-api-key" placeholder="输入新的 API Key 或留空保持不变">
+                <small style="color: #666;">${openaiConfig.apiKey ? '已配置: ' + openaiConfig.apiKey.slice(0, 10) + '...' : '未配置'}</small>
+            </div>
+            <div class="btn-group">
+                <button class="btn-primary" onclick="saveOpenAIConfig()">保存配置</button>
+                <button class="btn-green" onclick="activateProxy('openai')">激活此代理</button>
+            </div>
+            <div id="openaiStatus"></div>
         </div>
-        <div style="margin-bottom: 15px;">
-            <label>API Key（留空则使用环境变量配置）</label>
-            <input type="password" id="proxy-api-key" placeholder="输入新的 API Key 或留空保持不变">
-        </div>
-        <div class="btn-group">
-            <button class="btn-primary" onclick="saveProxyConfig()">保存代理配置</button>
-            <button class="btn-outline" onclick="testProxyConnection()">测试连接</button>
-        </div>
-        <div id="proxyStatus"></div>
     </div>
 
-    <h2 style="margin-top: 30px;">📋 模型配置</h2>
+    <h2 style="margin-top: 30px;">📋 模型映射配置</h2>
 
     <div class="grid">
         <div class="card">
@@ -2013,17 +2134,16 @@ async function handleConfigPage(env: Env): Promise<Response> {
             }
         }
 
-        // 保存代理配置
-        async function saveProxyConfig() {
-            const status = document.getElementById('proxyStatus');
+        // 保存 Claude 代理配置
+        async function saveClaudeConfig() {
+            const status = document.getElementById('claudeStatus');
             status.innerHTML = '<div class="status loading">保存中...</div>';
 
-            const baseUrl = document.getElementById('proxy-base-url').value.trim();
-            const apiKey = document.getElementById('proxy-api-key').value.trim();
-            const proxyType = document.getElementById('proxy-type').value;
+            const baseUrl = document.getElementById('claude-base-url').value.trim();
+            const apiKey = document.getElementById('claude-api-key').value.trim();
 
-            const body = { baseUrl, type: proxyType };
-            if (apiKey) body.apiKey = apiKey;
+            const body = { claude: { baseUrl } };
+            if (apiKey) body.claude.apiKey = apiKey;
 
             try {
                 const res = await fetch('/api/proxy-config', {
@@ -2034,10 +2154,8 @@ async function handleConfigPage(env: Env): Promise<Response> {
 
                 const data = await res.json();
                 if (data.success) {
-                    status.innerHTML = '<div class="status success">✅ 代理配置已保存并立即生效！类型: ' + data.type + '</div>';
-                    document.getElementById('proxy-api-key').value = '';
-                    // 刷新模型列表
-                    refreshModels();
+                    status.innerHTML = '<div class="status success">✅ Claude 配置已保存！</div>';
+                    document.getElementById('claude-api-key').value = '';
                 } else {
                     status.innerHTML = '<div class="status error">保存失败: ' + (data.error || '未知错误') + '</div>';
                 }
@@ -2046,27 +2164,59 @@ async function handleConfigPage(env: Env): Promise<Response> {
             }
         }
 
-        // 测试代理连接
-        async function testProxyConnection() {
-            const status = document.getElementById('proxyStatus');
-            status.innerHTML = '<div class="status loading">正在测试连接...</div>';
+        // 保存 OpenAI 代理配置
+        async function saveOpenAIConfig() {
+            const status = document.getElementById('openaiStatus');
+            status.innerHTML = '<div class="status loading">保存中...</div>';
+
+            const baseUrl = document.getElementById('openai-base-url').value.trim();
+            const apiKey = document.getElementById('openai-api-key').value.trim();
+
+            const body = { openai: { baseUrl } };
+            if (apiKey) body.openai.apiKey = apiKey;
 
             try {
-                const res = await fetch('/api/proxy-models');
-                const data = await res.json();
+                const res = await fetch('/api/proxy-config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
 
-                if (data.error) {
-                    status.innerHTML = '<div class="status error">连接失败: ' + data.error + '</div>';
-                } else if (data.data && data.data.length > 0) {
-                    status.innerHTML = '<div class="status success">✅ 连接成功！发现 ' + data.data.length + ' 个模型</div>';
-                    availableModels = data.data.map(m => m.id);
-                    updateModelList();
-                    updateSelects();
+                const data = await res.json();
+                if (data.success) {
+                    status.innerHTML = '<div class="status success">✅ OpenAI 配置已保存！</div>';
+                    document.getElementById('openai-api-key').value = '';
                 } else {
-                    status.innerHTML = '<div class="status error">连接成功但未找到模型</div>';
+                    status.innerHTML = '<div class="status error">保存失败: ' + (data.error || '未知错误') + '</div>';
                 }
             } catch (e) {
-                status.innerHTML = '<div class="status error">连接失败: ' + e.message + '</div>';
+                status.innerHTML = '<div class="status error">保存失败: ' + e.message + '</div>';
+            }
+        }
+
+        // 激活代理
+        async function activateProxy(type) {
+            const claudeStatus = document.getElementById('claudeStatus');
+            const openaiStatus = document.getElementById('openaiStatus');
+            const targetStatus = type === 'claude' ? claudeStatus : openaiStatus;
+            targetStatus.innerHTML = '<div class="status loading">切换中...</div>';
+
+            try {
+                const res = await fetch('/api/proxy-config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ activeType: type })
+                });
+
+                const data = await res.json();
+                if (data.success) {
+                    targetStatus.innerHTML = '<div class="status success">✅ 已激活 ' + type.toUpperCase() + ' 代理！页面将刷新...</div>';
+                    setTimeout(() => location.reload(), 1000);
+                } else {
+                    targetStatus.innerHTML = '<div class="status error">切换失败: ' + (data.error || '未知错误') + '</div>';
+                }
+            } catch (e) {
+                targetStatus.innerHTML = '<div class="status error">切换失败: ' + e.message + '</div>';
             }
         }
 
