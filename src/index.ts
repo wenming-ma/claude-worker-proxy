@@ -12,12 +12,14 @@ const RETRY_DELAY_MS = 1000 // 重试间隔（毫秒）
 type ProxyType = 'claude' | 'openai'
 
 // OpenAI 默认模型映射表（作为后备）
+// 2026年最新模型: gpt-5.2系列（旗舰）, gpt-5系列, o3/o4-mini（已被GPT-5取代）
 const DEFAULT_OPENAI_MODEL_MAPPING: { [key: string]: string } = {
-    'tinyy-model': 'gpt-4o',
-    'bigger-model': 'gpt-4-turbo',
-    'gpt-4': 'gpt-4-turbo',
-    'gpt-4o': 'gpt-4o',
-    'gpt-3.5-turbo': 'gpt-3.5-turbo'
+    'tinyy-model': 'gpt-5.2',
+    'bigger-model': 'gpt-5.2-pro',
+    'gpt-4': 'gpt-5.2',
+    'gpt-4o': 'gpt-5.2',
+    'gpt-4-turbo': 'gpt-5.2',
+    'gpt-3.5-turbo': 'gpt-5-mini'
 }
 
 // 当前 OpenAI 模型映射（可动态更新）
@@ -42,20 +44,38 @@ function mapOpenAIModelName(inputModel: string): string {
 }
 
 // OpenAI 模型优先级排序（数字越大越强）
+// 2026年最新排序: gpt-5.2-pro > gpt-5.2-codex > gpt-5.2 > gpt-5.1 > gpt-5 > o3 > o4-mini > gpt-5-mini > gpt-5-nano
 function getOpenAIModelPriority(modelId: string): number {
     const id = modelId.toLowerCase()
-    // o1 推理模型最强
+    // GPT-5.2 系列（2026最新旗舰）
+    if (id.includes('gpt-5.2-pro')) return 200
+    if (id.includes('gpt-5.2-codex')) return 195
+    if (id.includes('gpt-5.2')) return 190
+    // GPT-5.1 系列
+    if (id.includes('gpt-5.1-codex')) return 180
+    if (id.includes('gpt-5.1')) return 175
+    // GPT-5 基础系列
+    if (id.includes('gpt-5-mini')) return 140
+    if (id.includes('gpt-5-nano')) return 130
+    if (id.includes('gpt-5') && !id.includes('5.1') && !id.includes('5.2')) return 170
+    // o 系列推理模型（已被 GPT-5 取代，但仍可用）
+    if (id.includes('o3-deep-research')) return 165
+    if (id.includes('o3')) return 160
+    if (id.includes('o4-mini-deep-research')) return 150
+    if (id.includes('o4-mini')) return 145
     if (id.includes('o1-preview')) return 100
     if (id.includes('o1')) return 95
-    // gpt-4o 系列
-    if (id.includes('gpt-4o')) return 90
-    // gpt-4-turbo 系列
-    if (id.includes('gpt-4-turbo')) return 85
-    // gpt-4 基础
-    if (id.includes('gpt-4') && !id.includes('turbo')) return 80
-    // gpt-3.5-turbo
+    // GPT-4.1 系列（2025年模型）
+    if (id.includes('gpt-4.1-nano')) return 85
+    if (id.includes('gpt-4.1-mini')) return 88
+    if (id.includes('gpt-4.1')) return 92
+    // GPT-4 系列（旧模型）
+    if (id.includes('gpt-4o')) return 80
+    if (id.includes('gpt-4-turbo')) return 75
+    if (id.includes('gpt-4') && !id.includes('turbo') && !id.includes('4o') && !id.includes('4.1')) return 70
+    // GPT-3.5（旧模型）
     if (id.includes('gpt-3.5-turbo')) return 50
-    // 其他 claude 模型（兼容 API 可能返回）
+    // Claude 模型兼容（某些代理可能返回）
     if (id.includes('claude-opus')) return 92
     if (id.includes('claude-sonnet')) return 88
     if (id.includes('claude-haiku')) return 60
