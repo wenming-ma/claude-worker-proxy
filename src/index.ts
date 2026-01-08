@@ -948,30 +948,47 @@ async function handleGetLogs(env: Env): Promise<Response> {
 // 获取代理服务支持的模型列表
 async function handleGetProxyModels(env: Env): Promise<Response> {
     const proxyConfig = await getProxyConfig(env)
-    const claudeBaseUrl = proxyConfig.baseUrl
-    const claudeApiKey = proxyConfig.apiKey
+    const baseUrl = proxyConfig.baseUrl
+    const apiKey = proxyConfig.apiKey
+    const proxyType = proxyConfig.type
+
+    console.log(`[RefreshModels] 开始刷新模型列表`)
+    console.log(`[RefreshModels] 代理类型: ${proxyType}`)
+    console.log(`[RefreshModels] Base URL: ${baseUrl}`)
+    console.log(`[RefreshModels] API Key: ${apiKey ? apiKey.slice(0, 10) + '...' : '未设置'}`)
 
     try {
-        const modelsUrl = `${claudeBaseUrl}/v1/models`
-        const response = await fetch(modelsUrl, {
-            headers: {
-                'x-api-key': claudeApiKey || '',
-                'anthropic-version': '2023-06-01'
-            }
-        })
+        const modelsUrl = `${baseUrl}/v1/models`
+        console.log(`[RefreshModels] 请求 URL: ${modelsUrl}`)
+
+        const headers: Record<string, string> = {}
+        if (proxyType === 'openai') {
+            headers['Authorization'] = `Bearer ${apiKey || ''}`
+        } else {
+            headers['x-api-key'] = apiKey || ''
+            headers['anthropic-version'] = '2023-06-01'
+        }
+
+        const response = await fetch(modelsUrl, { headers })
+        console.log(`[RefreshModels] 响应状态: ${response.status}`)
 
         if (!response.ok) {
+            const errorText = await response.text()
+            console.error(`[RefreshModels] 请求失败: ${errorText}`)
             return new Response(
                 JSON.stringify({
                     error: 'Failed to fetch models from proxy',
                     status: response.status,
-                    proxy_url: claudeBaseUrl
+                    proxy_url: baseUrl,
+                    details: errorText
                 }),
                 { status: response.status, headers: { 'Content-Type': 'application/json' } }
             )
         }
 
         const data = await response.json()
+        const modelCount = (data as any).data?.length || 0
+        console.log(`[RefreshModels] 成功获取 ${modelCount} 个模型`)
 
         // 缓存到 KV
         if (env.CONFIG_KV) {
@@ -983,6 +1000,7 @@ async function handleGetProxyModels(env: Env): Promise<Response> {
             headers: { 'Content-Type': 'application/json' }
         })
     } catch (error) {
+        console.error(`[RefreshModels] 异常: ${error instanceof Error ? error.message : 'Unknown error'}`)
         return new Response(
             JSON.stringify({
                 error: 'Failed to fetch models',
@@ -1062,14 +1080,21 @@ async function handleAutoDetect(env: Env): Promise<Response> {
     const apiKey = proxyConfig.apiKey
     const proxyType = proxyConfig.type
 
+    console.log(`[AutoDetect] 开始自动检测模型`)
+    console.log(`[AutoDetect] 代理类型: ${proxyType}`)
+    console.log(`[AutoDetect] Base URL: ${baseUrl}`)
+
     try {
         // 根据代理类型选择不同的检测逻辑
         if (proxyType === 'openai') {
+            console.log(`[AutoDetect] 使用 OpenAI 检测逻辑`)
             return await autoDetectOpenAI(env, baseUrl, apiKey)
         } else {
+            console.log(`[AutoDetect] 使用 Claude 检测逻辑`)
             return await autoDetectClaude(env, baseUrl, apiKey)
         }
     } catch (error) {
+        console.error(`[AutoDetect] 异常: ${error instanceof Error ? error.message : 'Unknown error'}`)
         return new Response(
             JSON.stringify({
                 error: 'Auto-detect failed',
@@ -1083,6 +1108,8 @@ async function handleAutoDetect(env: Env): Promise<Response> {
 // Claude 模型自动检测
 async function autoDetectClaude(env: Env, baseUrl: string, apiKey: string): Promise<Response> {
     const modelsUrl = `${baseUrl}/v1/models`
+    console.log(`[AutoDetect-Claude] 请求模型列表: ${modelsUrl}`)
+
     const response = await fetch(modelsUrl, {
         headers: {
             'x-api-key': apiKey || '',
@@ -1090,11 +1117,16 @@ async function autoDetectClaude(env: Env, baseUrl: string, apiKey: string): Prom
         }
     })
 
+    console.log(`[AutoDetect-Claude] 响应状态: ${response.status}`)
+
     if (!response.ok) {
+        const errorText = await response.text()
+        console.error(`[AutoDetect-Claude] 请求失败: ${errorText}`)
         return new Response(
             JSON.stringify({
                 error: 'Failed to fetch models for auto-detect',
-                type: 'claude'
+                type: 'claude',
+                details: errorText
             }),
             { status: response.status, headers: { 'Content-Type': 'application/json' } }
         )
@@ -1102,6 +1134,7 @@ async function autoDetectClaude(env: Env, baseUrl: string, apiKey: string): Prom
 
     const data = (await response.json()) as { data: Array<{ id: string }> }
     const models = data.data?.map(m => m.id) || []
+    console.log(`[AutoDetect-Claude] 获取到 ${models.length} 个模型`)
 
     // 找到最新的 sonnet 和 opus 模型
     const sonnetModels = models
@@ -1121,6 +1154,10 @@ async function autoDetectClaude(env: Env, baseUrl: string, apiKey: string): Prom
     const latestOpus = opusModels[0] || 'claude-opus-4-5-20251101'
     const latestHaiku = haikuModels[0] || 'claude-haiku-4-5-20251001'
 
+    console.log(`[AutoDetect-Claude] 检测到 Sonnet: ${sonnetModels.length} 个, 最新: ${latestSonnet}`)
+    console.log(`[AutoDetect-Claude] 检测到 Opus: ${opusModels.length} 个, 最新: ${latestOpus}`)
+    console.log(`[AutoDetect-Claude] 检测到 Haiku: ${haikuModels.length} 个, 最新: ${latestHaiku}`)
+
     const newMapping = {
         'tinyy-model': latestSonnet,
         'bigger-model': latestOpus,
@@ -1130,6 +1167,8 @@ async function autoDetectClaude(env: Env, baseUrl: string, apiKey: string): Prom
         'gpt-3.5-turbo': latestHaiku
     }
 
+    console.log(`[AutoDetect-Claude] 新模型映射:`, JSON.stringify(newMapping))
+
     // 更新映射
     claude.setModelMapping(newMapping)
 
@@ -1138,6 +1177,7 @@ async function autoDetectClaude(env: Env, baseUrl: string, apiKey: string): Prom
         await env.CONFIG_KV.put(KV_MODEL_MAPPING, JSON.stringify(newMapping))
         await env.CONFIG_KV.put(KV_AVAILABLE_MODELS, JSON.stringify(data))
         await env.CONFIG_KV.put(KV_LAST_REFRESH, new Date().toISOString())
+        console.log(`[AutoDetect-Claude] 配置已保存到 KV`)
     }
 
     return new Response(
@@ -1164,6 +1204,7 @@ async function autoDetectClaude(env: Env, baseUrl: string, apiKey: string): Prom
 // OpenAI 模型自动检测
 async function autoDetectOpenAI(env: Env, baseUrl: string, apiKey: string): Promise<Response> {
     const modelsUrl = `${baseUrl}/v1/models`
+    console.log(`[AutoDetect-OpenAI] 请求模型列表: ${modelsUrl}`)
 
     try {
         const response = await fetch(modelsUrl, {
@@ -1172,9 +1213,13 @@ async function autoDetectOpenAI(env: Env, baseUrl: string, apiKey: string): Prom
             }
         })
 
+        console.log(`[AutoDetect-OpenAI] 响应状态: ${response.status}`)
+
         if (!response.ok) {
             // 模型列表 API 不可用，使用默认映射
-            console.log('[AutoDetect] OpenAI models API not available, using default mapping')
+            const errorText = await response.text()
+            console.log(`[AutoDetect-OpenAI] 模型 API 不可用: ${errorText}`)
+            console.log('[AutoDetect-OpenAI] 使用默认模型映射')
             const defaultMapping = { ...DEFAULT_OPENAI_MODEL_MAPPING }
             setOpenAIModelMapping(defaultMapping)
 
@@ -1196,9 +1241,11 @@ async function autoDetectOpenAI(env: Env, baseUrl: string, apiKey: string): Prom
 
         const data = (await response.json()) as { data: Array<{ id: string }> }
         const models = data.data?.map(m => m.id) || []
+        console.log(`[AutoDetect-OpenAI] 获取到 ${models.length} 个模型`)
 
         if (models.length === 0) {
             // 没有模型，使用默认映射
+            console.log('[AutoDetect-OpenAI] 未找到模型，使用默认映射')
             const defaultMapping = { ...DEFAULT_OPENAI_MODEL_MAPPING }
             setOpenAIModelMapping(defaultMapping)
 
@@ -1231,6 +1278,9 @@ async function autoDetectOpenAI(env: Env, baseUrl: string, apiKey: string): Prom
             })
             .sort((a, b) => getOpenAIModelPriority(b) - getOpenAIModelPriority(a))
 
+        console.log(`[AutoDetect-OpenAI] 过滤后聊天模型: ${sortedModels.length} 个`)
+        console.log(`[AutoDetect-OpenAI] 前5个模型(按优先级): ${sortedModels.slice(0, 5).join(', ')}`)
+
         // 选择最强的两个模型
         const strongestModel = sortedModels[0] || 'gpt-4o'
         const secondStrongest = sortedModels[1] || sortedModels[0] || 'gpt-4-turbo'
@@ -1242,6 +1292,10 @@ async function autoDetectOpenAI(env: Env, baseUrl: string, apiKey: string): Prom
             sortedModels[sortedModels.length - 1] ||
             'gpt-3.5-turbo'
 
+        console.log(`[AutoDetect-OpenAI] 最强模型: ${strongestModel}`)
+        console.log(`[AutoDetect-OpenAI] 次强模型: ${secondStrongest}`)
+        console.log(`[AutoDetect-OpenAI] 较弱模型: ${weakerModel}`)
+
         const newMapping = {
             'tinyy-model': secondStrongest,
             'bigger-model': strongestModel,
@@ -1251,6 +1305,8 @@ async function autoDetectOpenAI(env: Env, baseUrl: string, apiKey: string): Prom
             'gpt-3.5-turbo': weakerModel
         }
 
+        console.log(`[AutoDetect-OpenAI] 新模型映射:`, JSON.stringify(newMapping))
+
         // 更新映射
         setOpenAIModelMapping(newMapping)
 
@@ -1259,6 +1315,7 @@ async function autoDetectOpenAI(env: Env, baseUrl: string, apiKey: string): Prom
             await env.CONFIG_KV.put(KV_OPENAI_MODEL_MAPPING, JSON.stringify(newMapping))
             await env.CONFIG_KV.put(KV_AVAILABLE_MODELS, JSON.stringify(data))
             await env.CONFIG_KV.put(KV_LAST_REFRESH, new Date().toISOString())
+            console.log(`[AutoDetect-OpenAI] 配置已保存到 KV`)
         }
 
         return new Response(
@@ -1327,6 +1384,8 @@ async function handleGetProxyConfig(env: Env): Promise<Response> {
 
 // 保存代理配置 API（分别保存两种代理的配置）
 async function handleSaveProxyConfig(request: Request, env: Env): Promise<Response> {
+    console.log(`[SaveConfig] 收到配置保存请求`)
+
     try {
         const body = (await request.json()) as {
             activeType?: ProxyType
@@ -1334,8 +1393,15 @@ async function handleSaveProxyConfig(request: Request, env: Env): Promise<Respon
             openai?: { baseUrl?: string; apiKey?: string }
         }
 
+        console.log(`[SaveConfig] 请求内容:`, JSON.stringify({
+            activeType: body.activeType,
+            claude: body.claude ? { baseUrl: body.claude.baseUrl, apiKeySet: !!body.claude.apiKey } : undefined,
+            openai: body.openai ? { baseUrl: body.openai.baseUrl, apiKeySet: !!body.openai.apiKey } : undefined
+        }))
+
         // 更新激活的代理类型
         if (body.activeType) {
+            console.log(`[SaveConfig] 切换代理类型: ${body.activeType}`)
             await setActiveProxyType(env, body.activeType)
         }
 
@@ -1347,8 +1413,10 @@ async function handleSaveProxyConfig(request: Request, env: Env): Promise<Respon
                 apiKey: body.claude.apiKey !== undefined ? body.claude.apiKey : currentClaudeConfig.apiKey
             }
             cachedClaudeProxyConfig = newClaudeConfig
+            console.log(`[SaveConfig] 更新 Claude 配置: baseUrl=${newClaudeConfig.baseUrl}, apiKeySet=${!!newClaudeConfig.apiKey}`)
             if (env.CONFIG_KV) {
                 await env.CONFIG_KV.put(KV_CLAUDE_PROXY_CONFIG, JSON.stringify(newClaudeConfig))
+                console.log(`[SaveConfig] Claude 配置已保存到 KV`)
             }
         }
 
@@ -1360,11 +1428,14 @@ async function handleSaveProxyConfig(request: Request, env: Env): Promise<Respon
                 apiKey: body.openai.apiKey !== undefined ? body.openai.apiKey : currentOpenAIConfig.apiKey
             }
             cachedOpenAIProxyConfig = newOpenAIConfig
+            console.log(`[SaveConfig] 更新 OpenAI 配置: baseUrl=${newOpenAIConfig.baseUrl}, apiKeySet=${!!newOpenAIConfig.apiKey}`)
             if (env.CONFIG_KV) {
                 await env.CONFIG_KV.put(KV_OPENAI_PROXY_CONFIG, JSON.stringify(newOpenAIConfig))
+                console.log(`[SaveConfig] OpenAI 配置已保存到 KV`)
             }
         }
 
+        console.log(`[SaveConfig] 配置保存成功`)
         return new Response(
             JSON.stringify({
                 success: true,
@@ -1381,6 +1452,7 @@ async function handleSaveProxyConfig(request: Request, env: Env): Promise<Respon
             { headers: { 'Content-Type': 'application/json' } }
         )
     } catch (error) {
+        console.error(`[SaveConfig] 保存失败: ${error instanceof Error ? error.message : 'Unknown error'}`)
         return new Response(
             JSON.stringify({
                 error: 'Failed to save proxy config',
