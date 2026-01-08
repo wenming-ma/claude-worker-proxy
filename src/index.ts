@@ -8,8 +8,64 @@ const RETRY_STATUS_CODES = [502, 503, 504] // 需要重试的状态码
 const MAX_RETRIES = 10 // 最大重试次数
 const RETRY_DELAY_MS = 1000 // 重试间隔（毫秒）
 
+// 代理类型
+type ProxyType = 'claude' | 'openai'
+
+// OpenAI 默认模型映射表（作为后备）
+const DEFAULT_OPENAI_MODEL_MAPPING: { [key: string]: string } = {
+    'tinyy-model': 'gpt-4o',
+    'bigger-model': 'gpt-4-turbo',
+    'gpt-4': 'gpt-4-turbo',
+    'gpt-4o': 'gpt-4o',
+    'gpt-3.5-turbo': 'gpt-3.5-turbo'
+}
+
+// 当前 OpenAI 模型映射（可动态更新）
+let currentOpenAIModelMapping: { [key: string]: string } = { ...DEFAULT_OPENAI_MODEL_MAPPING }
+
+// 设置 OpenAI 模型映射
+function setOpenAIModelMapping(mapping: { [key: string]: string }) {
+    currentOpenAIModelMapping = { ...DEFAULT_OPENAI_MODEL_MAPPING, ...mapping }
+}
+
+// 获取 OpenAI 模型映射
+function getOpenAIModelMapping(): { [key: string]: string } {
+    return { ...currentOpenAIModelMapping }
+}
+
+// 映射 OpenAI 模型名
+function mapOpenAIModelName(inputModel: string): string {
+    if (currentOpenAIModelMapping[inputModel]) {
+        return currentOpenAIModelMapping[inputModel]
+    }
+    return inputModel
+}
+
+// OpenAI 模型优先级排序（数字越大越强）
+function getOpenAIModelPriority(modelId: string): number {
+    const id = modelId.toLowerCase()
+    // o1 推理模型最强
+    if (id.includes('o1-preview')) return 100
+    if (id.includes('o1')) return 95
+    // gpt-4o 系列
+    if (id.includes('gpt-4o')) return 90
+    // gpt-4-turbo 系列
+    if (id.includes('gpt-4-turbo')) return 85
+    // gpt-4 基础
+    if (id.includes('gpt-4') && !id.includes('turbo')) return 80
+    // gpt-3.5-turbo
+    if (id.includes('gpt-3.5-turbo')) return 50
+    // 其他 claude 模型（兼容 API 可能返回）
+    if (id.includes('claude-opus')) return 92
+    if (id.includes('claude-sonnet')) return 88
+    if (id.includes('claude-haiku')) return 60
+    // 默认
+    return 0
+}
+
 // KV 键名
 const KV_MODEL_MAPPING = 'model_mapping'
+const KV_OPENAI_MODEL_MAPPING = 'openai_model_mapping'
 const KV_AVAILABLE_MODELS = 'available_models'
 const KV_LAST_REFRESH = 'last_refresh'
 const KV_PROXY_CONFIG = 'proxy_config'
@@ -33,7 +89,7 @@ interface RequestLog {
 }
 
 // 代理配置缓存
-let cachedProxyConfig: { baseUrl: string; apiKey: string } | null = null
+let cachedProxyConfig: { baseUrl: string; apiKey: string; type: ProxyType } | null = null
 
 export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -71,7 +127,7 @@ export default {
 } satisfies ExportedHandler<Env>
 
 // 获取代理配置（优先从 KV，否则从环境变量）
-async function getProxyConfig(env: Env): Promise<{ baseUrl: string; apiKey: string }> {
+async function getProxyConfig(env: Env): Promise<{ baseUrl: string; apiKey: string; type: ProxyType }> {
     // 如果有缓存，直接返回
     if (cachedProxyConfig) {
         return cachedProxyConfig
@@ -84,7 +140,8 @@ async function getProxyConfig(env: Env): Promise<{ baseUrl: string; apiKey: stri
                 const config = JSON.parse(savedConfig)
                 cachedProxyConfig = {
                     baseUrl: config.baseUrl || env.CLAUDE_BASE_URL || 'https://api.anthropic.com',
-                    apiKey: config.apiKey || env.CLAUDE_API_KEY || ''
+                    apiKey: config.apiKey || env.CLAUDE_API_KEY || '',
+                    type: config.type || 'claude'
                 }
                 return cachedProxyConfig
             }
@@ -96,7 +153,8 @@ async function getProxyConfig(env: Env): Promise<{ baseUrl: string; apiKey: stri
     // 使用环境变量作为后备
     cachedProxyConfig = {
         baseUrl: env.CLAUDE_BASE_URL || 'https://api.anthropic.com',
-        apiKey: env.CLAUDE_API_KEY || ''
+        apiKey: env.CLAUDE_API_KEY || '',
+        type: 'claude'
     }
     return cachedProxyConfig
 }
@@ -105,12 +163,20 @@ async function getProxyConfig(env: Env): Promise<{ baseUrl: string; apiKey: stri
 async function initConfig(env: Env) {
     try {
         if (env.CONFIG_KV) {
-            // 加载模型映射
+            // 加载 Claude 模型映射
             const savedMapping = await env.CONFIG_KV.get(KV_MODEL_MAPPING)
             if (savedMapping) {
                 const mapping = JSON.parse(savedMapping)
                 claude.setModelMapping(mapping)
-                console.log('[Init] Loaded model mapping from KV')
+                console.log('[Init] Loaded Claude model mapping from KV')
+            }
+
+            // 加载 OpenAI 模型映射
+            const savedOpenAIMapping = await env.CONFIG_KV.get(KV_OPENAI_MODEL_MAPPING)
+            if (savedOpenAIMapping) {
+                const mapping = JSON.parse(savedOpenAIMapping)
+                setOpenAIModelMapping(mapping)
+                console.log('[Init] Loaded OpenAI model mapping from KV')
             }
 
             // 加载代理配置
@@ -119,9 +185,10 @@ async function initConfig(env: Env) {
                 const config = JSON.parse(savedConfig)
                 cachedProxyConfig = {
                     baseUrl: config.baseUrl || env.CLAUDE_BASE_URL || 'https://api.anthropic.com',
-                    apiKey: config.apiKey || env.CLAUDE_API_KEY || ''
+                    apiKey: config.apiKey || env.CLAUDE_API_KEY || '',
+                    type: config.type || 'claude'
                 }
-                console.log('[Init] Loaded proxy config from KV')
+                console.log('[Init] Loaded proxy config from KV, type:', cachedProxyConfig.type)
             }
         }
     } catch (e) {
@@ -242,7 +309,13 @@ async function handle(request: Request, env: Env, requestId: string, ctx: Execut
         if (request.method !== 'POST') {
             return new Response('Method not allowed', { status: 405 })
         }
-        return handleOpenAIToClaude(request, env, requestId, ctx)
+        // 根据配置的代理类型选择处理函数
+        const proxyConfig = await getProxyConfig(env)
+        if (proxyConfig.type === 'openai') {
+            return handleOpenAIToOpenAI(request, env, requestId, ctx)
+        } else {
+            return handleOpenAIToClaude(request, env, requestId, ctx)
+        }
     }
 
     // 模型列表端点（Cursor 需要）- 支持多种路径格式
@@ -499,6 +572,207 @@ async function handleOpenAIToClaude(
     }
 }
 
+// OpenAI → OpenAI 转发（直接转发，只做模型映射）
+async function handleOpenAIToOpenAI(
+    request: Request,
+    env: Env,
+    requestId: string,
+    ctx: ExecutionContext
+): Promise<Response> {
+    const startTime = Date.now()
+    const proxyConfig = await getProxyConfig(env)
+    const openaiApiKey = proxyConfig.apiKey
+    const openaiBaseUrl = proxyConfig.baseUrl
+
+    console.log(`[${requestId}] OpenAI → OpenAI forwarding`)
+    console.log(`[${requestId}] Target: ${openaiBaseUrl}`)
+
+    if (!openaiApiKey) {
+        console.error(`[${requestId}] Missing API Key`)
+        return new Response(
+            JSON.stringify({
+                error: {
+                    type: 'config_error',
+                    message: 'Missing API Key in proxy config',
+                    request_id: requestId
+                }
+            }),
+            { status: 500, headers: { 'Content-Type': 'application/json' } }
+        )
+    }
+
+    let requestBody: any = null
+    let hasImages = false
+    let mappedModel = ''
+
+    try {
+        // 克隆请求以便修改
+        const requestClone = request.clone()
+        requestBody = await requestClone.json()
+        console.log(`[${requestId}] Request model: ${requestBody.model}`)
+        console.log(`[${requestId}] Request messages count: ${requestBody.messages?.length}`)
+        console.log(`[${requestId}] Request stream: ${requestBody.stream}`)
+
+        // 保存最近一次请求内容到 KV（异步后台执行）
+        if (env.CONFIG_KV) {
+            ctx.waitUntil(env.CONFIG_KV.put(KV_LAST_REQUEST, JSON.stringify(requestBody, null, 2)))
+
+            const lastUserMessage = extractLastUserInput(requestBody.messages)
+            if (lastUserMessage) {
+                ctx.waitUntil(env.CONFIG_KV.put(KV_LAST_USER_INPUT, lastUserMessage))
+            }
+        }
+
+        // 检查是否有图片内容
+        hasImages = requestBody.messages?.some(
+            (m: any) => Array.isArray(m.content) && m.content.some((c: any) => c.type === 'image_url')
+        )
+        console.log(`[${requestId}] Has images: ${hasImages}`)
+
+        // 模型映射（使用动态映射）
+        const originalModel = requestBody.model
+        mappedModel = mapOpenAIModelName(originalModel)
+        console.log(`[${requestId}] Model mapping: ${originalModel} → ${mappedModel}`)
+
+        // 修改请求体中的模型名
+        requestBody.model = mappedModel
+
+        // 构建转发请求
+        const forwardUrl = `${openaiBaseUrl}/v1/chat/completions`
+        const forwardRequest = new Request(forwardUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${openaiApiKey}`
+            },
+            body: JSON.stringify(requestBody)
+        })
+
+        console.log(`[${requestId}] Forward URL: ${forwardUrl}`)
+
+        const openaiResponse = await fetchWithRetry(forwardRequest, requestId)
+        console.log(`[${requestId}] OpenAI response status: ${openaiResponse.status}`)
+
+        if (!openaiResponse.ok) {
+            const errorBody = await openaiResponse.clone().text()
+            console.error(`[${requestId}] OpenAI error response: ${errorBody}`)
+
+            // 保存错误响应到 KV（异步后台执行）
+            if (env.CONFIG_KV) {
+                ctx.waitUntil(env.CONFIG_KV.put(KV_LAST_RESPONSE, errorBody))
+            }
+
+            // 记录错误日志（异步后台执行）
+            ctx.waitUntil(
+                saveRequestLog(env, {
+                    id: requestId,
+                    timestamp: new Date().toISOString(),
+                    model: originalModel,
+                    mappedModel: mappedModel,
+                    messagesCount: requestBody?.messages?.length || 0,
+                    hasImages,
+                    stream: !!requestBody?.stream,
+                    status: openaiResponse.status,
+                    duration: Date.now() - startTime,
+                    error: `OpenAI API error: ${openaiResponse.status}`
+                })
+            )
+
+            return new Response(
+                JSON.stringify({
+                    error: {
+                        type: 'provider_error',
+                        message: `OpenAI API returned ${openaiResponse.status}`,
+                        details: errorBody,
+                        request_id: requestId
+                    }
+                }),
+                { status: openaiResponse.status, headers: { 'Content-Type': 'application/json' } }
+            )
+        }
+
+        // 记录成功日志（异步后台执行）
+        ctx.waitUntil(
+            saveRequestLog(env, {
+                id: requestId,
+                timestamp: new Date().toISOString(),
+                model: originalModel,
+                mappedModel: mappedModel,
+                messagesCount: requestBody?.messages?.length || 0,
+                hasImages,
+                stream: !!requestBody?.stream,
+                status: openaiResponse.status,
+                duration: Date.now() - startTime
+            })
+        )
+
+        // 保存响应内容到 KV（异步后台执行）
+        if (env.CONFIG_KV) {
+            if (requestBody?.stream) {
+                ctx.waitUntil(
+                    env.CONFIG_KV.put(
+                        KV_LAST_RESPONSE,
+                        JSON.stringify({ type: 'stream', message: '流式响应（内容已实时传输）' }, null, 2)
+                    )
+                )
+            } else {
+                ctx.waitUntil(
+                    (async () => {
+                        try {
+                            const responseClone = openaiResponse.clone()
+                            const responseText = await responseClone.text()
+                            await env.CONFIG_KV.put(KV_LAST_RESPONSE, responseText)
+                        } catch (e) {
+                            console.error('[Log] Failed to save response:', e)
+                        }
+                    })()
+                )
+            }
+        }
+
+        // 直接返回 OpenAI 响应（无需转换格式）
+        return openaiResponse
+    } catch (error) {
+        console.error(`[${requestId}] Forward error:`, error)
+
+        const errorResponse = JSON.stringify(
+            {
+                error: {
+                    type: 'forward_error',
+                    message: error instanceof Error ? error.message : 'Unknown forward error',
+                    request_id: requestId
+                }
+            },
+            null,
+            2
+        )
+
+        if (env.CONFIG_KV) {
+            ctx.waitUntil(env.CONFIG_KV.put(KV_LAST_RESPONSE, errorResponse))
+        }
+
+        ctx.waitUntil(
+            saveRequestLog(env, {
+                id: requestId,
+                timestamp: new Date().toISOString(),
+                model: requestBody?.model || 'unknown',
+                mappedModel: mappedModel || 'unknown',
+                messagesCount: requestBody?.messages?.length || 0,
+                hasImages,
+                stream: !!requestBody?.stream,
+                status: 500,
+                duration: Date.now() - startTime,
+                error: error instanceof Error ? error.message : 'Unknown error'
+            })
+        )
+
+        return new Response(errorResponse, {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' }
+        })
+    }
+}
+
 // 提取用户最后一条输入内容（只提取用户在输入框中输入的文本）
 function extractLastUserInput(messages: any[]): string | null {
     if (!messages || !Array.isArray(messages)) return null
@@ -700,88 +974,17 @@ async function handleSaveMapping(request: Request, env: Env): Promise<Response> 
 // 自动检测最新模型并设置映射
 async function handleAutoDetect(env: Env): Promise<Response> {
     const proxyConfig = await getProxyConfig(env)
-    const claudeBaseUrl = proxyConfig.baseUrl
-    const claudeApiKey = proxyConfig.apiKey
+    const baseUrl = proxyConfig.baseUrl
+    const apiKey = proxyConfig.apiKey
+    const proxyType = proxyConfig.type
 
     try {
-        // 获取可用模型
-        const modelsUrl = `${claudeBaseUrl}/v1/models`
-        const response = await fetch(modelsUrl, {
-            headers: {
-                'x-api-key': claudeApiKey || '',
-                'anthropic-version': '2023-06-01'
-            }
-        })
-
-        if (!response.ok) {
-            return new Response(
-                JSON.stringify({
-                    error: 'Failed to fetch models for auto-detect'
-                }),
-                { status: response.status, headers: { 'Content-Type': 'application/json' } }
-            )
+        // 根据代理类型选择不同的检测逻辑
+        if (proxyType === 'openai') {
+            return await autoDetectOpenAI(env, baseUrl, apiKey)
+        } else {
+            return await autoDetectClaude(env, baseUrl, apiKey)
         }
-
-        const data = (await response.json()) as { data: Array<{ id: string }> }
-        const models = data.data?.map(m => m.id) || []
-
-        // 找到最新的 sonnet 和 opus 模型
-        const sonnetModels = models
-            .filter(m => m.includes('sonnet'))
-            .sort()
-            .reverse()
-        const opusModels = models
-            .filter(m => m.includes('opus'))
-            .sort()
-            .reverse()
-        const haikuModels = models
-            .filter(m => m.includes('haiku'))
-            .sort()
-            .reverse()
-
-        const latestSonnet = sonnetModels[0] || 'claude-sonnet-4-5-20250929'
-        const latestOpus = opusModels[0] || 'claude-opus-4-5-20251101'
-        const latestHaiku = haikuModels[0] || 'claude-haiku-4-5-20251001'
-
-        const newMapping = {
-            'tinyy-model': latestSonnet,
-            'bigger-model': latestOpus,
-            'gpt-4': latestOpus,
-            'gpt-4o': latestSonnet,
-            'gpt-4-turbo': latestSonnet,
-            'gpt-3.5-turbo': latestHaiku
-        }
-
-        // 更新映射
-        claude.setModelMapping(newMapping)
-
-        // 保存到 KV
-        if (env.CONFIG_KV) {
-            await env.CONFIG_KV.put(KV_MODEL_MAPPING, JSON.stringify(newMapping))
-            await env.CONFIG_KV.put(KV_AVAILABLE_MODELS, JSON.stringify(data))
-            await env.CONFIG_KV.put(KV_LAST_REFRESH, new Date().toISOString())
-        }
-
-        return new Response(
-            JSON.stringify({
-                success: true,
-                detected: {
-                    sonnet: sonnetModels,
-                    opus: opusModels,
-                    haiku: haikuModels
-                },
-                selected: {
-                    latestSonnet,
-                    latestOpus,
-                    latestHaiku
-                },
-                mapping: newMapping,
-                all_models: models
-            }),
-            {
-                headers: { 'Content-Type': 'application/json' }
-            }
-        )
     } catch (error) {
         return new Response(
             JSON.stringify({
@@ -789,6 +992,225 @@ async function handleAutoDetect(env: Env): Promise<Response> {
                 message: error instanceof Error ? error.message : 'Unknown error'
             }),
             { status: 500, headers: { 'Content-Type': 'application/json' } }
+        )
+    }
+}
+
+// Claude 模型自动检测
+async function autoDetectClaude(env: Env, baseUrl: string, apiKey: string): Promise<Response> {
+    const modelsUrl = `${baseUrl}/v1/models`
+    const response = await fetch(modelsUrl, {
+        headers: {
+            'x-api-key': apiKey || '',
+            'anthropic-version': '2023-06-01'
+        }
+    })
+
+    if (!response.ok) {
+        return new Response(
+            JSON.stringify({
+                error: 'Failed to fetch models for auto-detect',
+                type: 'claude'
+            }),
+            { status: response.status, headers: { 'Content-Type': 'application/json' } }
+        )
+    }
+
+    const data = (await response.json()) as { data: Array<{ id: string }> }
+    const models = data.data?.map(m => m.id) || []
+
+    // 找到最新的 sonnet 和 opus 模型
+    const sonnetModels = models
+        .filter(m => m.includes('sonnet'))
+        .sort()
+        .reverse()
+    const opusModels = models
+        .filter(m => m.includes('opus'))
+        .sort()
+        .reverse()
+    const haikuModels = models
+        .filter(m => m.includes('haiku'))
+        .sort()
+        .reverse()
+
+    const latestSonnet = sonnetModels[0] || 'claude-sonnet-4-5-20250929'
+    const latestOpus = opusModels[0] || 'claude-opus-4-5-20251101'
+    const latestHaiku = haikuModels[0] || 'claude-haiku-4-5-20251001'
+
+    const newMapping = {
+        'tinyy-model': latestSonnet,
+        'bigger-model': latestOpus,
+        'gpt-4': latestOpus,
+        'gpt-4o': latestSonnet,
+        'gpt-4-turbo': latestSonnet,
+        'gpt-3.5-turbo': latestHaiku
+    }
+
+    // 更新映射
+    claude.setModelMapping(newMapping)
+
+    // 保存到 KV
+    if (env.CONFIG_KV) {
+        await env.CONFIG_KV.put(KV_MODEL_MAPPING, JSON.stringify(newMapping))
+        await env.CONFIG_KV.put(KV_AVAILABLE_MODELS, JSON.stringify(data))
+        await env.CONFIG_KV.put(KV_LAST_REFRESH, new Date().toISOString())
+    }
+
+    return new Response(
+        JSON.stringify({
+            success: true,
+            type: 'claude',
+            detected: {
+                sonnet: sonnetModels,
+                opus: opusModels,
+                haiku: haikuModels
+            },
+            selected: {
+                latestSonnet,
+                latestOpus,
+                latestHaiku
+            },
+            mapping: newMapping,
+            all_models: models
+        }),
+        { headers: { 'Content-Type': 'application/json' } }
+    )
+}
+
+// OpenAI 模型自动检测
+async function autoDetectOpenAI(env: Env, baseUrl: string, apiKey: string): Promise<Response> {
+    const modelsUrl = `${baseUrl}/v1/models`
+
+    try {
+        const response = await fetch(modelsUrl, {
+            headers: {
+                Authorization: `Bearer ${apiKey || ''}`
+            }
+        })
+
+        if (!response.ok) {
+            // 模型列表 API 不可用，使用默认映射
+            console.log('[AutoDetect] OpenAI models API not available, using default mapping')
+            const defaultMapping = { ...DEFAULT_OPENAI_MODEL_MAPPING }
+            setOpenAIModelMapping(defaultMapping)
+
+            if (env.CONFIG_KV) {
+                await env.CONFIG_KV.put(KV_OPENAI_MODEL_MAPPING, JSON.stringify(defaultMapping))
+                await env.CONFIG_KV.put(KV_LAST_REFRESH, new Date().toISOString())
+            }
+
+            return new Response(
+                JSON.stringify({
+                    success: true,
+                    type: 'openai',
+                    message: 'Models API not available, using default mapping',
+                    mapping: defaultMapping
+                }),
+                { headers: { 'Content-Type': 'application/json' } }
+            )
+        }
+
+        const data = (await response.json()) as { data: Array<{ id: string }> }
+        const models = data.data?.map(m => m.id) || []
+
+        if (models.length === 0) {
+            // 没有模型，使用默认映射
+            const defaultMapping = { ...DEFAULT_OPENAI_MODEL_MAPPING }
+            setOpenAIModelMapping(defaultMapping)
+
+            if (env.CONFIG_KV) {
+                await env.CONFIG_KV.put(KV_OPENAI_MODEL_MAPPING, JSON.stringify(defaultMapping))
+            }
+
+            return new Response(
+                JSON.stringify({
+                    success: true,
+                    type: 'openai',
+                    message: 'No models found, using default mapping',
+                    mapping: defaultMapping
+                }),
+                { headers: { 'Content-Type': 'application/json' } }
+            )
+        }
+
+        // 按优先级排序模型
+        const sortedModels = models
+            .filter(m => {
+                const id = m.toLowerCase()
+                // 只保留聊天模型
+                return (
+                    id.includes('gpt') ||
+                    id.includes('o1') ||
+                    id.includes('claude') ||
+                    id.includes('chat')
+                )
+            })
+            .sort((a, b) => getOpenAIModelPriority(b) - getOpenAIModelPriority(a))
+
+        // 选择最强的两个模型
+        const strongestModel = sortedModels[0] || 'gpt-4o'
+        const secondStrongest = sortedModels[1] || sortedModels[0] || 'gpt-4-turbo'
+
+        // 找到一个较弱的模型用于 gpt-3.5-turbo 映射
+        const weakerModel =
+            sortedModels.find(m => m.toLowerCase().includes('gpt-3.5')) ||
+            sortedModels.find(m => m.toLowerCase().includes('haiku')) ||
+            sortedModels[sortedModels.length - 1] ||
+            'gpt-3.5-turbo'
+
+        const newMapping = {
+            'tinyy-model': secondStrongest,
+            'bigger-model': strongestModel,
+            'gpt-4': strongestModel,
+            'gpt-4o': secondStrongest,
+            'gpt-4-turbo': secondStrongest,
+            'gpt-3.5-turbo': weakerModel
+        }
+
+        // 更新映射
+        setOpenAIModelMapping(newMapping)
+
+        // 保存到 KV
+        if (env.CONFIG_KV) {
+            await env.CONFIG_KV.put(KV_OPENAI_MODEL_MAPPING, JSON.stringify(newMapping))
+            await env.CONFIG_KV.put(KV_AVAILABLE_MODELS, JSON.stringify(data))
+            await env.CONFIG_KV.put(KV_LAST_REFRESH, new Date().toISOString())
+        }
+
+        return new Response(
+            JSON.stringify({
+                success: true,
+                type: 'openai',
+                sorted_by_priority: sortedModels.slice(0, 10),
+                selected: {
+                    strongest: strongestModel,
+                    secondStrongest: secondStrongest,
+                    weaker: weakerModel
+                },
+                mapping: newMapping,
+                all_models: models
+            }),
+            { headers: { 'Content-Type': 'application/json' } }
+        )
+    } catch (error) {
+        // 发生错误，使用默认映射
+        console.error('[AutoDetect] OpenAI error:', error)
+        const defaultMapping = { ...DEFAULT_OPENAI_MODEL_MAPPING }
+        setOpenAIModelMapping(defaultMapping)
+
+        if (env.CONFIG_KV) {
+            await env.CONFIG_KV.put(KV_OPENAI_MODEL_MAPPING, JSON.stringify(defaultMapping))
+        }
+
+        return new Response(
+            JSON.stringify({
+                success: true,
+                type: 'openai',
+                message: 'Auto-detect failed, using default mapping',
+                error: error instanceof Error ? error.message : 'Unknown error',
+                mapping: defaultMapping
+            }),
+            { headers: { 'Content-Type': 'application/json' } }
         )
     }
 }
@@ -802,6 +1224,7 @@ async function handleGetProxyConfig(env: Env): Promise<Response> {
             baseUrl: proxyConfig.baseUrl,
             apiKey: proxyConfig.apiKey ? proxyConfig.apiKey.slice(0, 10) + '...' : '',
             apiKeySet: !!proxyConfig.apiKey,
+            type: proxyConfig.type,
             envBaseUrl: env.CLAUDE_BASE_URL || 'https://api.anthropic.com',
             envApiKeySet: !!env.CLAUDE_API_KEY
         }),
@@ -812,7 +1235,7 @@ async function handleGetProxyConfig(env: Env): Promise<Response> {
 // 保存代理配置 API
 async function handleSaveProxyConfig(request: Request, env: Env): Promise<Response> {
     try {
-        const body = (await request.json()) as { baseUrl?: string; apiKey?: string }
+        const body = (await request.json()) as { baseUrl?: string; apiKey?: string; type?: ProxyType }
 
         // 获取当前配置
         const currentConfig = await getProxyConfig(env)
@@ -820,7 +1243,8 @@ async function handleSaveProxyConfig(request: Request, env: Env): Promise<Respon
         // 更新配置
         const newConfig = {
             baseUrl: body.baseUrl || currentConfig.baseUrl,
-            apiKey: body.apiKey || currentConfig.apiKey
+            apiKey: body.apiKey || currentConfig.apiKey,
+            type: body.type || currentConfig.type
         }
 
         // 保存到 KV
@@ -835,7 +1259,8 @@ async function handleSaveProxyConfig(request: Request, env: Env): Promise<Respon
             JSON.stringify({
                 success: true,
                 baseUrl: newConfig.baseUrl,
-                apiKeySet: !!newConfig.apiKey
+                apiKeySet: !!newConfig.apiKey,
+                type: newConfig.type
             }),
             { headers: { 'Content-Type': 'application/json' } }
         )
@@ -1354,8 +1779,15 @@ async function handleConfigPage(env: Env): Promise<Response> {
     <div class="card">
         <h2>🔌 代理服务设置</h2>
         <div style="margin-bottom: 15px;">
-            <label>Claude API Base URL</label>
-            <input type="text" id="proxy-base-url" placeholder="https://api.anthropic.com" value="${proxyConfig.baseUrl}">
+            <label>代理类型</label>
+            <select id="proxy-type" style="width: 100%; padding: 12px; border: 1px solid #0f3460; border-radius: 8px; background: #0f3460; color: #fff; font-size: 14px;">
+                <option value="claude" ${proxyConfig.type === 'claude' ? 'selected' : ''}>Claude API（OpenAI 格式 → Claude）</option>
+                <option value="openai" ${proxyConfig.type === 'openai' ? 'selected' : ''}>OpenAI API（直接转发）</option>
+            </select>
+        </div>
+        <div style="margin-bottom: 15px;">
+            <label>API Base URL</label>
+            <input type="text" id="proxy-base-url" placeholder="https://api.anthropic.com 或 https://api.openai.com" value="${proxyConfig.baseUrl}">
         </div>
         <div style="margin-bottom: 15px;">
             <label>API Key（留空则使用环境变量配置）</label>
@@ -1568,8 +2000,9 @@ async function handleConfigPage(env: Env): Promise<Response> {
 
             const baseUrl = document.getElementById('proxy-base-url').value.trim();
             const apiKey = document.getElementById('proxy-api-key').value.trim();
+            const proxyType = document.getElementById('proxy-type').value;
 
-            const body = { baseUrl };
+            const body = { baseUrl, type: proxyType };
             if (apiKey) body.apiKey = apiKey;
 
             try {
@@ -1581,7 +2014,7 @@ async function handleConfigPage(env: Env): Promise<Response> {
 
                 const data = await res.json();
                 if (data.success) {
-                    status.innerHTML = '<div class="status success">✅ 代理配置已保存并立即生效！</div>';
+                    status.innerHTML = '<div class="status success">✅ 代理配置已保存并立即生效！类型: ' + data.type + '</div>';
                     document.getElementById('proxy-api-key').value = '';
                     // 刷新模型列表
                     refreshModels();
