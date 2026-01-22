@@ -514,28 +514,120 @@ async function handleOpenAIToClaude(
         console.log(`[${requestId}] Has images: ${hasImages}`)
 
         const provider = new claude.ClaudeProvider()
-        const claudeRequest = await provider.convertToProviderRequest(request, claudeBaseUrl, claudeApiKey)
 
-        // 记录转换后的请求
-        const claudeRequestClone = claudeRequest.clone()
-        const claudeBody = await claudeRequestClone.json()
-        mappedModel = claudeBody.model
-        console.log(`[${requestId}] Claude request model: ${claudeBody.model}`)
-        console.log(`[${requestId}] Claude request URL: ${claudeRequest.url}`)
+        // 获取映射后的模型名（用于日志记录）
+        const modelMapping = claude.getModelMapping()
+        mappedModel = modelMapping[requestBody.model] || requestBody.model
+        console.log(`[${requestId}] Claude request model: ${mappedModel}`)
 
-        const claudeResponse = await fetchWithRetry(claudeRequest, requestId)
-        console.log(`[${requestId}] Claude response status: ${claudeResponse.status}`)
+        let convertedResponse: Response
 
-        if (!claudeResponse.ok) {
-            const errorBody = await claudeResponse.clone().text()
-            console.error(`[${requestId}] Claude error response: ${errorBody}`)
+        // 流式请求使用 SDK 处理，更稳定可靠
+        if (requestBody?.stream) {
+            console.log(`[${requestId}] Using SDK for streaming`)
 
-            // 保存错误响应到 KV（异步后台执行）
-            if (env.CONFIG_KV) {
-                ctx.waitUntil(env.CONFIG_KV.put(KV_LAST_RESPONSE, errorBody))
+            try {
+                convertedResponse = await provider.convertStreamWithSDK(claudeBaseUrl, claudeApiKey, requestBody)
+
+                // 记录成功日志（异步后台执行）
+                ctx.waitUntil(
+                    saveRequestLog(env, {
+                        id: requestId,
+                        timestamp: new Date().toISOString(),
+                        model: requestBody?.model || 'unknown',
+                        mappedModel: mappedModel || 'unknown',
+                        messagesCount: requestBody?.messages?.length || 0,
+                        hasImages,
+                        stream: true,
+                        status: 200,
+                        duration: Date.now() - startTime
+                    })
+                )
+            } catch (error) {
+                console.error(`[${requestId}] SDK stream error:`, error)
+
+                const errorBody = error instanceof Error ? error.message : 'Unknown SDK error'
+
+                // 保存错误响应到 KV（异步后台执行）
+                if (env.CONFIG_KV) {
+                    ctx.waitUntil(env.CONFIG_KV.put(KV_LAST_RESPONSE, errorBody))
+                }
+
+                // 记录错误日志（异步后台执行）
+                ctx.waitUntil(
+                    saveRequestLog(env, {
+                        id: requestId,
+                        timestamp: new Date().toISOString(),
+                        model: requestBody?.model || 'unknown',
+                        mappedModel: mappedModel || 'unknown',
+                        messagesCount: requestBody?.messages?.length || 0,
+                        hasImages,
+                        stream: true,
+                        status: 500,
+                        duration: Date.now() - startTime,
+                        error: `SDK stream error: ${errorBody}`
+                    })
+                )
+
+                return new Response(
+                    JSON.stringify({
+                        error: {
+                            type: 'provider_error',
+                            message: 'SDK stream error',
+                            details: errorBody,
+                            request_id: requestId
+                        }
+                    }),
+                    { status: 500, headers: { 'Content-Type': 'application/json' } }
+                )
+            }
+        } else {
+            // 非流式请求使用传统 fetch 方式
+            const claudeRequest = await provider.convertToProviderRequest(request, claudeBaseUrl, claudeApiKey)
+            console.log(`[${requestId}] Claude request URL: ${claudeRequest.url}`)
+
+            const claudeResponse = await fetchWithRetry(claudeRequest, requestId)
+            console.log(`[${requestId}] Claude response status: ${claudeResponse.status}`)
+
+            if (!claudeResponse.ok) {
+                const errorBody = await claudeResponse.clone().text()
+                console.error(`[${requestId}] Claude error response: ${errorBody}`)
+
+                // 保存错误响应到 KV（异步后台执行）
+                if (env.CONFIG_KV) {
+                    ctx.waitUntil(env.CONFIG_KV.put(KV_LAST_RESPONSE, errorBody))
+                }
+
+                // 记录错误日志（异步后台执行）
+                ctx.waitUntil(
+                    saveRequestLog(env, {
+                        id: requestId,
+                        timestamp: new Date().toISOString(),
+                        model: requestBody?.model || 'unknown',
+                        mappedModel: mappedModel || 'unknown',
+                        messagesCount: requestBody?.messages?.length || 0,
+                        hasImages,
+                        stream: false,
+                        status: claudeResponse.status,
+                        duration: Date.now() - startTime,
+                        error: `Claude API error: ${claudeResponse.status}`
+                    })
+                )
+
+                return new Response(
+                    JSON.stringify({
+                        error: {
+                            type: 'provider_error',
+                            message: `Claude API returned ${claudeResponse.status}`,
+                            details: errorBody,
+                            request_id: requestId
+                        }
+                    }),
+                    { status: claudeResponse.status, headers: { 'Content-Type': 'application/json' } }
+                )
             }
 
-            // 记录错误日志（异步后台执行）
+            // 记录成功日志（异步后台执行）
             ctx.waitUntil(
                 saveRequestLog(env, {
                     id: requestId,
@@ -544,43 +636,15 @@ async function handleOpenAIToClaude(
                     mappedModel: mappedModel || 'unknown',
                     messagesCount: requestBody?.messages?.length || 0,
                     hasImages,
-                    stream: !!requestBody?.stream,
+                    stream: false,
                     status: claudeResponse.status,
-                    duration: Date.now() - startTime,
-                    error: `Claude API error: ${claudeResponse.status}`
+                    duration: Date.now() - startTime
                 })
             )
 
-            return new Response(
-                JSON.stringify({
-                    error: {
-                        type: 'provider_error',
-                        message: `Claude API returned ${claudeResponse.status}`,
-                        details: errorBody,
-                        request_id: requestId
-                    }
-                }),
-                { status: claudeResponse.status, headers: { 'Content-Type': 'application/json' } }
-            )
+            // 转换响应
+            convertedResponse = await provider.convertToClaudeResponse(claudeResponse)
         }
-
-        // 记录成功日志（异步后台执行）
-        ctx.waitUntil(
-            saveRequestLog(env, {
-                id: requestId,
-                timestamp: new Date().toISOString(),
-                model: requestBody?.model || 'unknown',
-                mappedModel: mappedModel || 'unknown',
-                messagesCount: requestBody?.messages?.length || 0,
-                hasImages,
-                stream: !!requestBody?.stream,
-                status: claudeResponse.status,
-                duration: Date.now() - startTime
-            })
-        )
-
-        // 转换响应
-        const convertedResponse = await provider.convertToClaudeResponse(claudeResponse)
 
         // 保存响应内容到 KV（异步后台执行，不阻塞主流程）
         if (env.CONFIG_KV) {

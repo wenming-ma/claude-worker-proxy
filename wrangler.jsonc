@@ -4,8 +4,8 @@
     "main": "src/index.ts",
     "compatibility_date": "2025-06-20",
     "vars": {
-        "CLAUDE_API_KEY": "cr_792fe201363ff3d74cd3e817204c40dda90b1ac637d2fa563d9347cce8aa43b4",
-        "CLAUDE_BASE_URL": "https://as086nwvpbrnivunc.imds.ai/api"
+        "CLAUDE_API_KEY": "cr_e0004507949e2d9b4de61875aa885ee0533a43591645ba938bbb3a69789db43e",
+        "CLAUDE_BASE_URL": "https://api.123577.xyz/api"
     },
     "kv_namespaces": [
         {
