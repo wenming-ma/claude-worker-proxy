@@ -88,9 +88,9 @@ const KV_MODEL_MAPPING = 'model_mapping'
 const KV_OPENAI_MODEL_MAPPING = 'openai_model_mapping'
 const KV_AVAILABLE_MODELS = 'available_models'
 const KV_LAST_REFRESH = 'last_refresh'
-const KV_CLAUDE_PROXY_CONFIG = 'claude_proxy_config'  // Claude 代理配置
-const KV_OPENAI_PROXY_CONFIG = 'openai_proxy_config'  // OpenAI 代理配置
-const KV_ACTIVE_PROXY_TYPE = 'active_proxy_type'      // 当前激活的代理类型
+const KV_CLAUDE_PROXY_CONFIG = 'claude_proxy_config' // Claude 代理配置
+const KV_OPENAI_PROXY_CONFIG = 'openai_proxy_config' // OpenAI 代理配置
+const KV_ACTIVE_PROXY_TYPE = 'active_proxy_type' // 当前激活的代理类型
 const KV_REQUEST_LOGS = 'request_logs'
 const KV_LAST_REQUEST = 'last_request'
 const KV_LAST_RESPONSE = 'last_response'
@@ -579,29 +579,62 @@ async function handleOpenAIToClaude(
             })
         )
 
-        // 保存响应内容到 KV（异步后台执行）
+        // 转换响应
+        const convertedResponse = await provider.convertToClaudeResponse(claudeResponse)
+
+        // 保存响应内容到 KV（异步后台执行，不阻塞主流程）
         if (env.CONFIG_KV) {
             if (requestBody?.stream) {
-                // 流式响应：保存说明
-                ctx.waitUntil(
-                    env.CONFIG_KV.put(
-                        KV_LAST_RESPONSE,
-                        JSON.stringify(
-                            {
-                                type: 'stream',
-                                message: '流式响应（内容已实时传输，未保存完整内容）'
-                            },
-                            null,
-                            2
-                        )
-                    )
-                )
-            } else {
-                // 非流式响应：保存完整内容
+                // 流式响应：克隆后在后台异步收集完整内容
+                const responseClone = convertedResponse.clone()
                 ctx.waitUntil(
                     (async () => {
                         try {
-                            const responseClone = claudeResponse.clone()
+                            const reader = responseClone.body?.getReader()
+                            if (!reader) return
+
+                            const decoder = new TextDecoder()
+                            let buffer = ''
+                            let fullContent = ''
+
+                            while (true) {
+                                const { done, value } = await reader.read()
+                                if (done) break
+
+                                buffer += decoder.decode(value, { stream: true })
+                                const lines = buffer.split('\n')
+                                buffer = lines.pop() || ''
+
+                                for (const line of lines) {
+                                    if (!line.startsWith('data: ')) continue
+                                    const jsonStr = line.slice(6)
+                                    if (jsonStr === '[DONE]') continue
+                                    try {
+                                        const event = JSON.parse(jsonStr)
+                                        if (event.choices?.[0]?.delta?.content) {
+                                            fullContent += event.choices[0].delta.content
+                                        }
+                                    } catch {
+                                        // 忽略解析错误
+                                    }
+                                }
+                            }
+
+                            await env.CONFIG_KV.put(
+                                KV_LAST_RESPONSE,
+                                JSON.stringify({ type: 'stream', content: fullContent }, null, 2)
+                            )
+                        } catch (e) {
+                            console.error('[Log] Failed to collect stream content:', e)
+                        }
+                    })()
+                )
+            } else {
+                // 非流式响应：克隆后保存完整内容
+                const responseClone = convertedResponse.clone()
+                ctx.waitUntil(
+                    (async () => {
+                        try {
                             const responseText = await responseClone.text()
                             await env.CONFIG_KV.put(KV_LAST_RESPONSE, responseText)
                         } catch (e) {
@@ -612,7 +645,7 @@ async function handleOpenAIToClaude(
             }
         }
 
-        return await provider.convertToClaudeResponse(claudeResponse)
+        return convertedResponse
     } catch (error) {
         console.error(`[${requestId}] Conversion error:`, error)
 
@@ -790,21 +823,60 @@ async function handleOpenAIToOpenAI(
             })
         )
 
+        // 克隆响应用于保存（不阻塞主响应）
+        const responseToReturn = openaiResponse.clone()
+
         // 保存响应内容到 KV（异步后台执行）
         if (env.CONFIG_KV) {
             if (requestBody?.stream) {
+                // 流式响应：在后台异步收集完整内容
                 ctx.waitUntil(
-                    env.CONFIG_KV.put(
-                        KV_LAST_RESPONSE,
-                        JSON.stringify({ type: 'stream', message: '流式响应（内容已实时传输）' }, null, 2)
-                    )
+                    (async () => {
+                        try {
+                            const reader = openaiResponse.body?.getReader()
+                            if (!reader) return
+
+                            const decoder = new TextDecoder()
+                            let buffer = ''
+                            let fullContent = ''
+
+                            while (true) {
+                                const { done, value } = await reader.read()
+                                if (done) break
+
+                                buffer += decoder.decode(value, { stream: true })
+                                const lines = buffer.split('\n')
+                                buffer = lines.pop() || ''
+
+                                for (const line of lines) {
+                                    if (!line.startsWith('data: ')) continue
+                                    const jsonStr = line.slice(6)
+                                    if (jsonStr === '[DONE]') continue
+                                    try {
+                                        const event = JSON.parse(jsonStr)
+                                        if (event.choices?.[0]?.delta?.content) {
+                                            fullContent += event.choices[0].delta.content
+                                        }
+                                    } catch {
+                                        // 忽略解析错误
+                                    }
+                                }
+                            }
+
+                            await env.CONFIG_KV.put(
+                                KV_LAST_RESPONSE,
+                                JSON.stringify({ type: 'stream', content: fullContent }, null, 2)
+                            )
+                        } catch (e) {
+                            console.error('[Log] Failed to collect stream content:', e)
+                        }
+                    })()
                 )
             } else {
                 ctx.waitUntil(
                     (async () => {
                         try {
-                            const responseClone = openaiResponse.clone()
-                            const responseText = await responseClone.text()
+                            const responseText = await openaiResponse.text()
                             await env.CONFIG_KV.put(KV_LAST_RESPONSE, responseText)
                         } catch (e) {
                             console.error('[Log] Failed to save response:', e)
@@ -815,7 +887,7 @@ async function handleOpenAIToOpenAI(
         }
 
         // 直接返回 OpenAI 响应（无需转换格式）
-        return openaiResponse
+        return responseToReturn
     } catch (error) {
         console.error(`[${requestId}] Forward error:`, error)
 
@@ -1269,12 +1341,7 @@ async function autoDetectOpenAI(env: Env, baseUrl: string, apiKey: string): Prom
             .filter(m => {
                 const id = m.toLowerCase()
                 // 只保留聊天模型
-                return (
-                    id.includes('gpt') ||
-                    id.includes('o1') ||
-                    id.includes('claude') ||
-                    id.includes('chat')
-                )
+                return id.includes('gpt') || id.includes('o1') || id.includes('claude') || id.includes('chat')
             })
             .sort((a, b) => getOpenAIModelPriority(b) - getOpenAIModelPriority(a))
 
@@ -1393,11 +1460,14 @@ async function handleSaveProxyConfig(request: Request, env: Env): Promise<Respon
             openai?: { baseUrl?: string; apiKey?: string }
         }
 
-        console.log(`[SaveConfig] 请求内容:`, JSON.stringify({
-            activeType: body.activeType,
-            claude: body.claude ? { baseUrl: body.claude.baseUrl, apiKeySet: !!body.claude.apiKey } : undefined,
-            openai: body.openai ? { baseUrl: body.openai.baseUrl, apiKeySet: !!body.openai.apiKey } : undefined
-        }))
+        console.log(
+            `[SaveConfig] 请求内容:`,
+            JSON.stringify({
+                activeType: body.activeType,
+                claude: body.claude ? { baseUrl: body.claude.baseUrl, apiKeySet: !!body.claude.apiKey } : undefined,
+                openai: body.openai ? { baseUrl: body.openai.baseUrl, apiKeySet: !!body.openai.apiKey } : undefined
+            })
+        )
 
         // 更新激活的代理类型
         if (body.activeType) {
@@ -1413,7 +1483,9 @@ async function handleSaveProxyConfig(request: Request, env: Env): Promise<Respon
                 apiKey: body.claude.apiKey !== undefined ? body.claude.apiKey : currentClaudeConfig.apiKey
             }
             cachedClaudeProxyConfig = newClaudeConfig
-            console.log(`[SaveConfig] 更新 Claude 配置: baseUrl=${newClaudeConfig.baseUrl}, apiKeySet=${!!newClaudeConfig.apiKey}`)
+            console.log(
+                `[SaveConfig] 更新 Claude 配置: baseUrl=${newClaudeConfig.baseUrl}, apiKeySet=${!!newClaudeConfig.apiKey}`
+            )
             if (env.CONFIG_KV) {
                 await env.CONFIG_KV.put(KV_CLAUDE_PROXY_CONFIG, JSON.stringify(newClaudeConfig))
                 console.log(`[SaveConfig] Claude 配置已保存到 KV`)
@@ -1428,7 +1500,9 @@ async function handleSaveProxyConfig(request: Request, env: Env): Promise<Respon
                 apiKey: body.openai.apiKey !== undefined ? body.openai.apiKey : currentOpenAIConfig.apiKey
             }
             cachedOpenAIProxyConfig = newOpenAIConfig
-            console.log(`[SaveConfig] 更新 OpenAI 配置: baseUrl=${newOpenAIConfig.baseUrl}, apiKeySet=${!!newOpenAIConfig.apiKey}`)
+            console.log(
+                `[SaveConfig] 更新 OpenAI 配置: baseUrl=${newOpenAIConfig.baseUrl}, apiKeySet=${!!newOpenAIConfig.apiKey}`
+            )
             if (env.CONFIG_KV) {
                 await env.CONFIG_KV.put(KV_OPENAI_PROXY_CONFIG, JSON.stringify(newOpenAIConfig))
                 console.log(`[SaveConfig] OpenAI 配置已保存到 KV`)
@@ -2401,7 +2475,7 @@ async function handleLogsPage(env: Env): Promise<Response> {
         <ul style="line-height: 2; color: #aaa; padding-left: 20px;">
             <li>日志会自动记录最近 5 条 API 请求</li>
             <li>最近一次请求和响应内容可直接复制用于调试</li>
-            <li>流式响应不会保存完整内容（实时传输）</li>
+            <li>流式响应会在后台异步收集并保存完整内容</li>
             <li>如需查看更详细的实时日志，可在终端运行：<code style="background: #0f3460; padding: 2px 8px; border-radius: 4px; color: #00d4ff;">npx wrangler tail</code></li>
         </ul>
     </div>

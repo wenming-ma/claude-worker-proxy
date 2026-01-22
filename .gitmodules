@@ -1,0 +1,3 @@
+[submodule "openrouter"]
+	path = openrouter
+	url = https://github.com/OpenRouterTeam/typescript-sdk.git
