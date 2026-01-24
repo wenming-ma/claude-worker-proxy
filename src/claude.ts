@@ -679,8 +679,12 @@ export class ClaudeProvider implements provider.Provider {
 
             try {
                 console.log('[SDK Stream] Starting stream request')
-                console.log(`[SDK Stream] Model: ${claudeParams.model}, Messages: ${claudeParams.messages.length}, MaxTokens: ${claudeParams.max_tokens}`)
-                console.log(`[SDK Stream] Tools: ${claudeParams.tools?.length || 0}, Thinking: ${(claudeParams as any).thinking ? 'enabled' : 'disabled'}`)
+                console.log(
+                    `[SDK Stream] Model: ${claudeParams.model}, Messages: ${claudeParams.messages.length}, MaxTokens: ${claudeParams.max_tokens}`
+                )
+                console.log(
+                    `[SDK Stream] Tools: ${claudeParams.tools?.length || 0}, Thinking: ${(claudeParams as any).thinking ? 'enabled' : 'disabled'}`
+                )
                 // 检查消息类型
                 for (let i = 0; i < claudeParams.messages.length; i++) {
                     const msg = claudeParams.messages[i]
@@ -818,10 +822,14 @@ export class ClaudeProvider implements provider.Provider {
                 }
 
                 // 获取最终消息以获取 stop_reason
-                console.log(`[SDK Stream] Stream loop completed, total events: ${eventCount}, duration: ${Date.now() - startTime}ms`)
+                console.log(
+                    `[SDK Stream] Stream loop completed, total events: ${eventCount}, duration: ${Date.now() - startTime}ms`
+                )
                 const finalMessage = await stream.finalMessage()
                 const finishReason = this.convertStopReason(finalMessage.stop_reason) || 'stop'
-                console.log(`[SDK Stream] Final message stop_reason: ${finalMessage.stop_reason}, mapped to: ${finishReason}`)
+                console.log(
+                    `[SDK Stream] Final message stop_reason: ${finalMessage.stop_reason}, mapped to: ${finishReason}`
+                )
 
                 // 发送 finish_reason
                 const finishChunk = {
