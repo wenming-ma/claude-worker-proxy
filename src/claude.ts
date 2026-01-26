@@ -133,10 +133,25 @@ export class ClaudeProvider implements provider.Provider {
             // 处理 tool 消息 - 需要合并连续的 tool_result 到一个 user 消息中
             // Claude API 要求消息必须交替（user → assistant → user）
             if (message.role === 'tool') {
+                // 提取 tool 消息的实际内容
+                // Cursor 可能发送数组格式: [{"type":"text","text":"..."}]
+                let toolContent = ''
+                if (typeof message.content === 'string') {
+                    toolContent = message.content
+                } else if (Array.isArray(message.content)) {
+                    // 提取所有 text 类型的内容
+                    toolContent = message.content
+                        .filter((item: any) => item.type === 'text')
+                        .map((item: any) => item.text || '')
+                        .join('\n')
+                }
+
+                console.log('[Tool] id:', message.tool_call_id, 'content_len:', toolContent.length)
+
                 const toolResult = {
                     type: 'tool_result' as const,
                     tool_use_id: message.tool_call_id!,
-                    content: typeof message.content === 'string' ? message.content : ''
+                    content: toolContent
                 }
 
                 // 检查上一个消息是否是 user 且包含 tool_result
