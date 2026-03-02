@@ -1,7 +1,17 @@
+import * as http from 'http'
+import 'dotenv/config'
 import * as provider from './provider'
 import * as gemini from './gemini'
 import * as openai from './openai'
 import * as claude from './claude'
+import * as storage from './storage'
+
+// 环境变量配置
+const ENV = {
+    CLAUDE_API_KEY: process.env.CLAUDE_API_KEY || '',
+    CLAUDE_BASE_URL: process.env.CLAUDE_BASE_URL || 'https://api.anthropic.com',
+    PORT: parseInt(process.env.PORT || '8080', 10)
+}
 
 // 重试配置
 const RETRY_STATUS_CODES = [502, 503, 504] // 需要重试的状态码
@@ -121,25 +131,66 @@ let cachedClaudeProxyConfig: ProxyConfig | null = null
 let cachedOpenAIProxyConfig: ProxyConfig | null = null
 let cachedActiveProxyType: ProxyType = 'claude'
 
-export default {
-    async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+// Convert Node.js IncomingMessage to Web API Request
+function toWebRequest(req: http.IncomingMessage): Promise<Request> {
+    return new Promise((resolve, reject) => {
+        const chunks: Buffer[] = []
+        req.on('data', (chunk: Buffer) => chunks.push(chunk))
+        req.on('end', () => {
+            const url = `http://localhost:${ENV.PORT}${req.url || '/'}`
+            const headers = new Headers()
+            for (const [key, value] of Object.entries(req.headers)) {
+                if (value) headers.set(key, Array.isArray(value) ? value.join(', ') : value)
+            }
+            const method = req.method || 'GET'
+            const body = chunks.length > 0 ? Buffer.concat(chunks) : undefined
+            resolve(new Request(url, {
+                method,
+                headers,
+                body: method !== 'GET' && method !== 'HEAD' ? body : undefined
+            }))
+        })
+        req.on('error', reject)
+    })
+}
+
+// Send Web API Response to Node.js ServerResponse
+async function sendWebResponse(webRes: Response, nodeRes: http.ServerResponse): Promise<void> {
+    nodeRes.writeHead(webRes.status, Object.fromEntries(webRes.headers.entries()))
+    if (webRes.body) {
+        const reader = webRes.body.getReader()
+        try {
+            while (true) {
+                const { done, value } = await reader.read()
+                if (done) break
+                nodeRes.write(value)
+            }
+        } finally {
+            reader.releaseLock()
+        }
+    }
+    nodeRes.end()
+}
+
+// Initialize storage and start server
+storage.load()
+initConfig().then(() => {
+    const server = http.createServer(async (req, res) => {
         const startTime = Date.now()
         const requestId = crypto.randomUUID().slice(0, 8)
 
         try {
-            // 初始化配置（模型映射和代理配置）
-            await initConfig(env)
-
-            const response = await handle(request, env, requestId, ctx)
+            const webRequest = await toWebRequest(req)
+            const response = await handle(webRequest, requestId)
             const duration = Date.now() - startTime
             console.log(
-                `[${requestId}] ${request.method} ${new URL(request.url).pathname} - ${response.status} (${duration}ms)`
+                `[${requestId}] ${webRequest.method} ${new URL(webRequest.url).pathname} - ${response.status} (${duration}ms)`
             )
-            return response
+            await sendWebResponse(response, res)
         } catch (error) {
             const duration = Date.now() - startTime
             console.error(`[${requestId}] ERROR (${duration}ms):`, error)
-            return new Response(
+            const errorResponse = new Response(
                 JSON.stringify({
                     error: {
                         type: 'internal_error',
@@ -152,9 +203,16 @@ export default {
                     headers: { 'Content-Type': 'application/json' }
                 }
             )
+            await sendWebResponse(errorResponse, res)
         }
-    }
-} satisfies ExportedHandler<Env>
+    })
+
+    server.listen(ENV.PORT, '0.0.0.0', () => {
+        console.log(`[Server] Claude Worker Proxy running at http://0.0.0.0:${ENV.PORT}`)
+        console.log(`[Server] Claude Base URL: ${ENV.CLAUDE_BASE_URL}`)
+        console.log(`[Server] API Key: ${ENV.CLAUDE_API_KEY ? ENV.CLAUDE_API_KEY.slice(0, 10) + '...' : 'NOT SET'}`)
+    })
+})
 
 // 获取当前激活的代理类型
 function getActiveProxyType(): ProxyType {
@@ -162,55 +220,49 @@ function getActiveProxyType(): ProxyType {
 }
 
 // 设置当前激活的代理类型
-async function setActiveProxyType(env: Env, type: ProxyType): Promise<void> {
+async function setActiveProxyType(type: ProxyType): Promise<void> {
     cachedActiveProxyType = type
-    if (env.CONFIG_KV) {
-        await env.CONFIG_KV.put(KV_ACTIVE_PROXY_TYPE, type)
-    }
+    await storage.put(KV_ACTIVE_PROXY_TYPE, type)
 }
 
 // 获取 Claude 代理配置
-async function getClaudeProxyConfig(env: Env): Promise<ProxyConfig> {
+async function getClaudeProxyConfig(): Promise<ProxyConfig> {
     if (cachedClaudeProxyConfig) {
         return cachedClaudeProxyConfig
     }
 
     try {
-        if (env.CONFIG_KV) {
-            const savedConfig = await env.CONFIG_KV.get(KV_CLAUDE_PROXY_CONFIG)
-            if (savedConfig) {
-                cachedClaudeProxyConfig = JSON.parse(savedConfig)
-                return cachedClaudeProxyConfig!
-            }
+        const savedConfig = await storage.get(KV_CLAUDE_PROXY_CONFIG)
+        if (savedConfig) {
+            cachedClaudeProxyConfig = JSON.parse(savedConfig)
+            return cachedClaudeProxyConfig!
         }
     } catch (e) {
-        console.error('[Config] Failed to load Claude proxy config from KV:', e)
+        console.error('[Config] Failed to load Claude proxy config from storage:', e)
     }
 
     // 使用环境变量作为后备
     cachedClaudeProxyConfig = {
-        baseUrl: env.CLAUDE_BASE_URL || 'https://api.anthropic.com',
-        apiKey: env.CLAUDE_API_KEY || ''
+        baseUrl: ENV.CLAUDE_BASE_URL,
+        apiKey: ENV.CLAUDE_API_KEY
     }
     return cachedClaudeProxyConfig
 }
 
 // 获取 OpenAI 代理配置
-async function getOpenAIProxyConfig(env: Env): Promise<ProxyConfig> {
+async function getOpenAIProxyConfig(): Promise<ProxyConfig> {
     if (cachedOpenAIProxyConfig) {
         return cachedOpenAIProxyConfig
     }
 
     try {
-        if (env.CONFIG_KV) {
-            const savedConfig = await env.CONFIG_KV.get(KV_OPENAI_PROXY_CONFIG)
-            if (savedConfig) {
-                cachedOpenAIProxyConfig = JSON.parse(savedConfig)
-                return cachedOpenAIProxyConfig!
-            }
+        const savedConfig = await storage.get(KV_OPENAI_PROXY_CONFIG)
+        if (savedConfig) {
+            cachedOpenAIProxyConfig = JSON.parse(savedConfig)
+            return cachedOpenAIProxyConfig!
         }
     } catch (e) {
-        console.error('[Config] Failed to load OpenAI proxy config from KV:', e)
+        console.error('[Config] Failed to load OpenAI proxy config from storage:', e)
     }
 
     // OpenAI 默认配置
@@ -222,61 +274,59 @@ async function getOpenAIProxyConfig(env: Env): Promise<ProxyConfig> {
 }
 
 // 获取当前激活的代理配置（根据类型返回对应配置）
-async function getProxyConfig(env: Env): Promise<{ baseUrl: string; apiKey: string; type: ProxyType }> {
+async function getProxyConfig(): Promise<{ baseUrl: string; apiKey: string; type: ProxyType }> {
     const proxyType = getActiveProxyType()
 
     if (proxyType === 'openai') {
-        const config = await getOpenAIProxyConfig(env)
+        const config = await getOpenAIProxyConfig()
         return { ...config, type: 'openai' }
     } else {
-        const config = await getClaudeProxyConfig(env)
+        const config = await getClaudeProxyConfig()
         return { ...config, type: 'claude' }
     }
 }
 
-// 初始化配置（从 KV 加载模型映射和代理配置）
-async function initConfig(env: Env) {
+// 初始化配置（从 storage 加载模型映射和代理配置）
+async function initConfig() {
     try {
-        if (env.CONFIG_KV) {
-            // 加载 Claude 模型映射
-            const savedMapping = await env.CONFIG_KV.get(KV_MODEL_MAPPING)
-            if (savedMapping) {
-                const mapping = JSON.parse(savedMapping)
-                claude.setModelMapping(mapping)
-                console.log('[Init] Loaded Claude model mapping from KV')
-            }
+        // 加载 Claude 模型映射
+        const savedMapping = await storage.get(KV_MODEL_MAPPING)
+        if (savedMapping) {
+            const mapping = JSON.parse(savedMapping)
+            claude.setModelMapping(mapping)
+            console.log('[Init] Loaded Claude model mapping from storage')
+        }
 
-            // 加载 OpenAI 模型映射
-            const savedOpenAIMapping = await env.CONFIG_KV.get(KV_OPENAI_MODEL_MAPPING)
-            if (savedOpenAIMapping) {
-                const mapping = JSON.parse(savedOpenAIMapping)
-                setOpenAIModelMapping(mapping)
-                console.log('[Init] Loaded OpenAI model mapping from KV')
-            }
+        // 加载 OpenAI 模型映射
+        const savedOpenAIMapping = await storage.get(KV_OPENAI_MODEL_MAPPING)
+        if (savedOpenAIMapping) {
+            const mapping = JSON.parse(savedOpenAIMapping)
+            setOpenAIModelMapping(mapping)
+            console.log('[Init] Loaded OpenAI model mapping from storage')
+        }
 
-            // 加载当前激活的代理类型
-            const savedType = await env.CONFIG_KV.get(KV_ACTIVE_PROXY_TYPE)
-            if (savedType) {
-                cachedActiveProxyType = savedType as ProxyType
-                console.log('[Init] Loaded active proxy type from KV:', cachedActiveProxyType)
-            }
+        // 加载当前激活的代理类型
+        const savedType = await storage.get(KV_ACTIVE_PROXY_TYPE)
+        if (savedType) {
+            cachedActiveProxyType = savedType as ProxyType
+            console.log('[Init] Loaded active proxy type from storage:', cachedActiveProxyType)
+        }
 
-            // 加载 Claude 代理配置
-            const savedClaudeConfig = await env.CONFIG_KV.get(KV_CLAUDE_PROXY_CONFIG)
-            if (savedClaudeConfig) {
-                cachedClaudeProxyConfig = JSON.parse(savedClaudeConfig)
-                console.log('[Init] Loaded Claude proxy config from KV')
-            }
+        // 加载 Claude 代理配置
+        const savedClaudeConfig = await storage.get(KV_CLAUDE_PROXY_CONFIG)
+        if (savedClaudeConfig) {
+            cachedClaudeProxyConfig = JSON.parse(savedClaudeConfig)
+            console.log('[Init] Loaded Claude proxy config from storage')
+        }
 
-            // 加载 OpenAI 代理配置
-            const savedOpenAIConfig = await env.CONFIG_KV.get(KV_OPENAI_PROXY_CONFIG)
-            if (savedOpenAIConfig) {
-                cachedOpenAIProxyConfig = JSON.parse(savedOpenAIConfig)
-                console.log('[Init] Loaded OpenAI proxy config from KV')
-            }
+        // 加载 OpenAI 代理配置
+        const savedOpenAIConfig = await storage.get(KV_OPENAI_PROXY_CONFIG)
+        if (savedOpenAIConfig) {
+            cachedOpenAIProxyConfig = JSON.parse(savedOpenAIConfig)
+            console.log('[Init] Loaded OpenAI proxy config from storage')
         }
     } catch (e) {
-        console.error('[Init] Failed to load config from KV:', e)
+        console.error('[Init] Failed to load config from storage:', e)
     }
 }
 
@@ -330,58 +380,58 @@ function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-async function handle(request: Request, env: Env, requestId: string, ctx: ExecutionContext): Promise<Response> {
+async function handle(request: Request, requestId: string): Promise<Response> {
     const url = new URL(request.url)
     const pathname = url.pathname
 
     // 配置页面
     if (pathname === '/config' || pathname === '/settings') {
-        return handleConfigPage(env)
+        return handleConfigPage()
     }
 
     // API: 获取代理支持的模型
     if (pathname === '/api/proxy-models') {
-        return handleGetProxyModels(env)
+        return handleGetProxyModels()
     }
 
     // API: 获取当前映射配置
     if (pathname === '/api/mapping' && request.method === 'GET') {
-        return handleGetMapping(env)
+        return handleGetMapping()
     }
 
     // API: 保存映射配置
     if (pathname === '/api/mapping' && request.method === 'POST') {
-        return handleSaveMapping(request, env)
+        return handleSaveMapping(request)
     }
 
     // API: 自动检测并设置最新模型
     if (pathname === '/api/auto-detect') {
-        return handleAutoDetect(env)
+        return handleAutoDetect()
     }
 
     // API: 获取代理配置
     if (pathname === '/api/proxy-config' && request.method === 'GET') {
-        return handleGetProxyConfig(env)
+        return handleGetProxyConfig()
     }
 
     // API: 保存代理配置
     if (pathname === '/api/proxy-config' && request.method === 'POST') {
-        return handleSaveProxyConfig(request, env)
+        return handleSaveProxyConfig(request)
     }
 
     // API: 获取请求日志
     if (pathname === '/api/logs') {
-        return handleGetLogs(env)
+        return handleGetLogs()
     }
 
     // 日志/调试页面
     if (pathname === '/logs' || pathname === '/debug') {
-        return handleLogsPage(env)
+        return handleLogsPage()
     }
 
     // 测试端点 - 发送测试请求并返回详细信息
     if (pathname === '/test') {
-        return handleTestEndpoint(env)
+        return handleTestEndpoint()
     }
 
     // OpenAI 兼容路由 - 支持多种路径格式
@@ -394,11 +444,11 @@ async function handle(request: Request, env: Env, requestId: string, ctx: Execut
             return new Response('Method not allowed', { status: 405 })
         }
         // 根据配置的代理类型选择处理函数
-        const proxyConfig = await getProxyConfig(env)
+        const proxyConfig = await getProxyConfig()
         if (proxyConfig.type === 'openai') {
-            return handleOpenAIToOpenAI(request, env, requestId, ctx)
+            return handleOpenAIToOpenAI(request, requestId)
         } else {
-            return handleOpenAIToClaude(request, env, requestId, ctx)
+            return handleOpenAIToClaude(request, requestId)
         }
     }
 
@@ -409,12 +459,12 @@ async function handle(request: Request, env: Env, requestId: string, ctx: Execut
 
     // 交互式聊天测试页面
     if (pathname === '/chat') {
-        return handleChatPage(env)
+        return handleChatPage()
     }
 
     // 根路径返回首页
     if (pathname === '/' || pathname === '') {
-        return handleHomePage(env)
+        return handleHomePage()
     }
 
     // 现有：Claude → Provider 路由
@@ -458,12 +508,10 @@ async function handle(request: Request, env: Env, requestId: string, ctx: Execut
 
 async function handleOpenAIToClaude(
     request: Request,
-    env: Env,
-    requestId: string,
-    ctx: ExecutionContext
+    requestId: string
 ): Promise<Response> {
     const startTime = Date.now()
-    const proxyConfig = await getProxyConfig(env)
+    const proxyConfig = await getProxyConfig()
     const claudeApiKey = proxyConfig.apiKey
     const claudeBaseUrl = proxyConfig.baseUrl
 
@@ -496,15 +544,13 @@ async function handleOpenAIToClaude(
         console.log(`[${requestId}] Request messages count: ${requestBody.messages?.length}`)
         console.log(`[${requestId}] Request stream: ${requestBody.stream}`)
 
-        // 保存最近一次请求内容到 KV（异步后台执行）
-        if (env.CONFIG_KV) {
-            ctx.waitUntil(env.CONFIG_KV.put(KV_LAST_REQUEST, JSON.stringify(requestBody, null, 2)))
+        // 保存最近一次请求内容到 storage（异步后台执行）
+        storage.put(KV_LAST_REQUEST, JSON.stringify(requestBody, null, 2))
 
-            // 提取并保存用户最后一条输入（只保存用户在输入框中输入的内容）
-            const lastUserMessage = extractLastUserInput(requestBody.messages)
-            if (lastUserMessage) {
-                ctx.waitUntil(env.CONFIG_KV.put(KV_LAST_USER_INPUT, lastUserMessage))
-            }
+        // 提取并保存用户最后一条输入（只保存用户在输入框中输入的内容）
+        const lastUserMessage = extractLastUserInput(requestBody.messages)
+        if (lastUserMessage) {
+            storage.put(KV_LAST_USER_INPUT, lastUserMessage)
         }
 
         // 检查是否有图片内容
@@ -530,44 +576,38 @@ async function handleOpenAIToClaude(
                 convertedResponse = await provider.convertStreamWithSDK(claudeBaseUrl, claudeApiKey, requestBody)
 
                 // 记录成功日志（异步后台执行）
-                ctx.waitUntil(
-                    saveRequestLog(env, {
-                        id: requestId,
-                        timestamp: new Date().toISOString(),
-                        model: requestBody?.model || 'unknown',
-                        mappedModel: mappedModel || 'unknown',
-                        messagesCount: requestBody?.messages?.length || 0,
-                        hasImages,
-                        stream: true,
-                        status: 200,
-                        duration: Date.now() - startTime
-                    })
-                )
+                saveRequestLog({
+                    id: requestId,
+                    timestamp: new Date().toISOString(),
+                    model: requestBody?.model || 'unknown',
+                    mappedModel: mappedModel || 'unknown',
+                    messagesCount: requestBody?.messages?.length || 0,
+                    hasImages,
+                    stream: true,
+                    status: 200,
+                    duration: Date.now() - startTime
+                })
             } catch (error) {
                 console.error(`[${requestId}] SDK stream error:`, error)
 
                 const errorBody = error instanceof Error ? error.message : 'Unknown SDK error'
 
-                // 保存错误响应到 KV（异步后台执行）
-                if (env.CONFIG_KV) {
-                    ctx.waitUntil(env.CONFIG_KV.put(KV_LAST_RESPONSE, errorBody))
-                }
+                // 保存错误响应到 storage（异步后台执行）
+                storage.put(KV_LAST_RESPONSE, errorBody)
 
                 // 记录错误日志（异步后台执行）
-                ctx.waitUntil(
-                    saveRequestLog(env, {
-                        id: requestId,
-                        timestamp: new Date().toISOString(),
-                        model: requestBody?.model || 'unknown',
-                        mappedModel: mappedModel || 'unknown',
-                        messagesCount: requestBody?.messages?.length || 0,
-                        hasImages,
-                        stream: true,
-                        status: 500,
-                        duration: Date.now() - startTime,
-                        error: `SDK stream error: ${errorBody}`
-                    })
-                )
+                saveRequestLog({
+                    id: requestId,
+                    timestamp: new Date().toISOString(),
+                    model: requestBody?.model || 'unknown',
+                    mappedModel: mappedModel || 'unknown',
+                    messagesCount: requestBody?.messages?.length || 0,
+                    hasImages,
+                    stream: true,
+                    status: 500,
+                    duration: Date.now() - startTime,
+                    error: `SDK stream error: ${errorBody}`
+                })
 
                 return new Response(
                     JSON.stringify({
@@ -593,26 +633,22 @@ async function handleOpenAIToClaude(
                 const errorBody = await claudeResponse.clone().text()
                 console.error(`[${requestId}] Claude error response: ${errorBody}`)
 
-                // 保存错误响应到 KV（异步后台执行）
-                if (env.CONFIG_KV) {
-                    ctx.waitUntil(env.CONFIG_KV.put(KV_LAST_RESPONSE, errorBody))
-                }
+                // 保存错误响应到 storage（异步后台执行）
+                storage.put(KV_LAST_RESPONSE, errorBody)
 
                 // 记录错误日志（异步后台执行）
-                ctx.waitUntil(
-                    saveRequestLog(env, {
-                        id: requestId,
-                        timestamp: new Date().toISOString(),
-                        model: requestBody?.model || 'unknown',
-                        mappedModel: mappedModel || 'unknown',
-                        messagesCount: requestBody?.messages?.length || 0,
-                        hasImages,
-                        stream: false,
-                        status: claudeResponse.status,
-                        duration: Date.now() - startTime,
-                        error: `Claude API error: ${claudeResponse.status}`
-                    })
-                )
+                saveRequestLog({
+                    id: requestId,
+                    timestamp: new Date().toISOString(),
+                    model: requestBody?.model || 'unknown',
+                    mappedModel: mappedModel || 'unknown',
+                    messagesCount: requestBody?.messages?.length || 0,
+                    hasImages,
+                    stream: false,
+                    status: claudeResponse.status,
+                    duration: Date.now() - startTime,
+                    error: `Claude API error: ${claudeResponse.status}`
+                })
 
                 return new Response(
                     JSON.stringify({
@@ -628,85 +664,77 @@ async function handleOpenAIToClaude(
             }
 
             // 记录成功日志（异步后台执行）
-            ctx.waitUntil(
-                saveRequestLog(env, {
-                    id: requestId,
-                    timestamp: new Date().toISOString(),
-                    model: requestBody?.model || 'unknown',
-                    mappedModel: mappedModel || 'unknown',
-                    messagesCount: requestBody?.messages?.length || 0,
-                    hasImages,
-                    stream: false,
-                    status: claudeResponse.status,
-                    duration: Date.now() - startTime
-                })
-            )
+            saveRequestLog({
+                id: requestId,
+                timestamp: new Date().toISOString(),
+                model: requestBody?.model || 'unknown',
+                mappedModel: mappedModel || 'unknown',
+                messagesCount: requestBody?.messages?.length || 0,
+                hasImages,
+                stream: false,
+                status: claudeResponse.status,
+                duration: Date.now() - startTime
+            })
 
             // 转换响应
             convertedResponse = await provider.convertToClaudeResponse(claudeResponse)
         }
 
-        // 保存响应内容到 KV（异步后台执行，不阻塞主流程）
-        if (env.CONFIG_KV) {
-            if (requestBody?.stream) {
-                // 流式响应：克隆后在后台异步收集完整内容
-                const responseClone = convertedResponse.clone()
-                ctx.waitUntil(
-                    (async () => {
-                        try {
-                            const reader = responseClone.body?.getReader()
-                            if (!reader) return
+        // 保存响应内容到 storage（异步后台执行，不阻塞主流程）
+        if (requestBody?.stream) {
+            // 流式响应：克隆后在后台异步收集完整内容
+            const responseClone = convertedResponse.clone()
+            ;(async () => {
+                try {
+                    const reader = responseClone.body?.getReader()
+                    if (!reader) return
 
-                            const decoder = new TextDecoder()
-                            let buffer = ''
-                            let fullContent = ''
+                    const decoder = new TextDecoder()
+                    let buffer = ''
+                    let fullContent = ''
 
-                            while (true) {
-                                const { done, value } = await reader.read()
-                                if (done) break
+                    while (true) {
+                        const { done, value } = await reader.read()
+                        if (done) break
 
-                                buffer += decoder.decode(value, { stream: true })
-                                const lines = buffer.split('\n')
-                                buffer = lines.pop() || ''
+                        buffer += decoder.decode(value, { stream: true })
+                        const lines = buffer.split('\n')
+                        buffer = lines.pop() || ''
 
-                                for (const line of lines) {
-                                    if (!line.startsWith('data: ')) continue
-                                    const jsonStr = line.slice(6)
-                                    if (jsonStr === '[DONE]') continue
-                                    try {
-                                        const event = JSON.parse(jsonStr)
-                                        if (event.choices?.[0]?.delta?.content) {
-                                            fullContent += event.choices[0].delta.content
-                                        }
-                                    } catch {
-                                        // 忽略解析错误
-                                    }
+                        for (const line of lines) {
+                            if (!line.startsWith('data: ')) continue
+                            const jsonStr = line.slice(6)
+                            if (jsonStr === '[DONE]') continue
+                            try {
+                                const event = JSON.parse(jsonStr)
+                                if (event.choices?.[0]?.delta?.content) {
+                                    fullContent += event.choices[0].delta.content
                                 }
+                            } catch {
+                                // 忽略解析错误
                             }
+                        }
+                    }
 
-                            await env.CONFIG_KV.put(
-                                KV_LAST_RESPONSE,
-                                JSON.stringify({ type: 'stream', content: fullContent }, null, 2)
-                            )
-                        } catch (e) {
-                            console.error('[Log] Failed to collect stream content:', e)
-                        }
-                    })()
-                )
-            } else {
-                // 非流式响应：克隆后保存完整内容
-                const responseClone = convertedResponse.clone()
-                ctx.waitUntil(
-                    (async () => {
-                        try {
-                            const responseText = await responseClone.text()
-                            await env.CONFIG_KV.put(KV_LAST_RESPONSE, responseText)
-                        } catch (e) {
-                            console.error('[Log] Failed to save response:', e)
-                        }
-                    })()
-                )
-            }
+                    await storage.put(
+                        KV_LAST_RESPONSE,
+                        JSON.stringify({ type: 'stream', content: fullContent }, null, 2)
+                    )
+                } catch (e) {
+                    console.error('[Log] Failed to collect stream content:', e)
+                }
+            })()
+        } else {
+            // 非流式响应：克隆后保存完整内容
+            const responseClone = convertedResponse.clone()
+            ;(async () => {
+                try {
+                    const responseText = await responseClone.text()
+                    await storage.put(KV_LAST_RESPONSE, responseText)
+                } catch (e) {
+                    console.error('[Log] Failed to save response:', e)
+                }
+            })()
         }
 
         return convertedResponse
@@ -725,26 +753,22 @@ async function handleOpenAIToClaude(
             2
         )
 
-        // 保存异常响应到 KV（异步后台执行）
-        if (env.CONFIG_KV) {
-            ctx.waitUntil(env.CONFIG_KV.put(KV_LAST_RESPONSE, errorResponse))
-        }
+        // 保存异常响应到 storage（异步后台执行）
+        storage.put(KV_LAST_RESPONSE, errorResponse)
 
         // 记录异常日志（异步后台执行）
-        ctx.waitUntil(
-            saveRequestLog(env, {
-                id: requestId,
-                timestamp: new Date().toISOString(),
-                model: requestBody?.model || 'unknown',
-                mappedModel: mappedModel || 'unknown',
-                messagesCount: requestBody?.messages?.length || 0,
-                hasImages,
-                stream: !!requestBody?.stream,
-                status: 500,
-                duration: Date.now() - startTime,
-                error: error instanceof Error ? error.message : 'Unknown error'
-            })
-        )
+        saveRequestLog({
+            id: requestId,
+            timestamp: new Date().toISOString(),
+            model: requestBody?.model || 'unknown',
+            mappedModel: mappedModel || 'unknown',
+            messagesCount: requestBody?.messages?.length || 0,
+            hasImages,
+            stream: !!requestBody?.stream,
+            status: 500,
+            duration: Date.now() - startTime,
+            error: error instanceof Error ? error.message : 'Unknown error'
+        })
 
         return new Response(errorResponse, {
             status: 500,
@@ -756,12 +780,10 @@ async function handleOpenAIToClaude(
 // OpenAI → OpenAI 转发（直接转发，只做模型映射）
 async function handleOpenAIToOpenAI(
     request: Request,
-    env: Env,
-    requestId: string,
-    ctx: ExecutionContext
+    requestId: string
 ): Promise<Response> {
     const startTime = Date.now()
-    const proxyConfig = await getProxyConfig(env)
+    const proxyConfig = await getProxyConfig()
     const openaiApiKey = proxyConfig.apiKey
     const openaiBaseUrl = proxyConfig.baseUrl
 
@@ -794,14 +816,12 @@ async function handleOpenAIToOpenAI(
         console.log(`[${requestId}] Request messages count: ${requestBody.messages?.length}`)
         console.log(`[${requestId}] Request stream: ${requestBody.stream}`)
 
-        // 保存最近一次请求内容到 KV（异步后台执行）
-        if (env.CONFIG_KV) {
-            ctx.waitUntil(env.CONFIG_KV.put(KV_LAST_REQUEST, JSON.stringify(requestBody, null, 2)))
+        // 保存最近一次请求内容到 storage（异步后台执行）
+        storage.put(KV_LAST_REQUEST, JSON.stringify(requestBody, null, 2))
 
-            const lastUserMessage = extractLastUserInput(requestBody.messages)
-            if (lastUserMessage) {
-                ctx.waitUntil(env.CONFIG_KV.put(KV_LAST_USER_INPUT, lastUserMessage))
-            }
+        const lastUserMessage = extractLastUserInput(requestBody.messages)
+        if (lastUserMessage) {
+            storage.put(KV_LAST_USER_INPUT, lastUserMessage)
         }
 
         // 检查是否有图片内容
@@ -838,26 +858,22 @@ async function handleOpenAIToOpenAI(
             const errorBody = await openaiResponse.clone().text()
             console.error(`[${requestId}] OpenAI error response: ${errorBody}`)
 
-            // 保存错误响应到 KV（异步后台执行）
-            if (env.CONFIG_KV) {
-                ctx.waitUntil(env.CONFIG_KV.put(KV_LAST_RESPONSE, errorBody))
-            }
+            // 保存错误响应到 storage（异步后台执行）
+            storage.put(KV_LAST_RESPONSE, errorBody)
 
             // 记录错误日志（异步后台执行）
-            ctx.waitUntil(
-                saveRequestLog(env, {
-                    id: requestId,
-                    timestamp: new Date().toISOString(),
-                    model: originalModel,
-                    mappedModel: mappedModel,
-                    messagesCount: requestBody?.messages?.length || 0,
-                    hasImages,
-                    stream: !!requestBody?.stream,
-                    status: openaiResponse.status,
-                    duration: Date.now() - startTime,
-                    error: `OpenAI API error: ${openaiResponse.status}`
-                })
-            )
+            saveRequestLog({
+                id: requestId,
+                timestamp: new Date().toISOString(),
+                model: originalModel,
+                mappedModel: mappedModel,
+                messagesCount: requestBody?.messages?.length || 0,
+                hasImages,
+                stream: !!requestBody?.stream,
+                status: openaiResponse.status,
+                duration: Date.now() - startTime,
+                error: `OpenAI API error: ${openaiResponse.status}`
+            })
 
             return new Response(
                 JSON.stringify({
@@ -873,81 +889,73 @@ async function handleOpenAIToOpenAI(
         }
 
         // 记录成功日志（异步后台执行）
-        ctx.waitUntil(
-            saveRequestLog(env, {
-                id: requestId,
-                timestamp: new Date().toISOString(),
-                model: originalModel,
-                mappedModel: mappedModel,
-                messagesCount: requestBody?.messages?.length || 0,
-                hasImages,
-                stream: !!requestBody?.stream,
-                status: openaiResponse.status,
-                duration: Date.now() - startTime
-            })
-        )
+        saveRequestLog({
+            id: requestId,
+            timestamp: new Date().toISOString(),
+            model: originalModel,
+            mappedModel: mappedModel,
+            messagesCount: requestBody?.messages?.length || 0,
+            hasImages,
+            stream: !!requestBody?.stream,
+            status: openaiResponse.status,
+            duration: Date.now() - startTime
+        })
 
         // 克隆响应用于保存（不阻塞主响应）
         const responseToReturn = openaiResponse.clone()
 
-        // 保存响应内容到 KV（异步后台执行）
-        if (env.CONFIG_KV) {
-            if (requestBody?.stream) {
-                // 流式响应：在后台异步收集完整内容
-                ctx.waitUntil(
-                    (async () => {
-                        try {
-                            const reader = openaiResponse.body?.getReader()
-                            if (!reader) return
+        // 保存响应内容到 storage（异步后台执行）
+        if (requestBody?.stream) {
+            // 流式响应：在后台异步收集完整内容
+            ;(async () => {
+                try {
+                    const reader = openaiResponse.body?.getReader()
+                    if (!reader) return
 
-                            const decoder = new TextDecoder()
-                            let buffer = ''
-                            let fullContent = ''
+                    const decoder = new TextDecoder()
+                    let buffer = ''
+                    let fullContent = ''
 
-                            while (true) {
-                                const { done, value } = await reader.read()
-                                if (done) break
+                    while (true) {
+                        const { done, value } = await reader.read()
+                        if (done) break
 
-                                buffer += decoder.decode(value, { stream: true })
-                                const lines = buffer.split('\n')
-                                buffer = lines.pop() || ''
+                        buffer += decoder.decode(value, { stream: true })
+                        const lines = buffer.split('\n')
+                        buffer = lines.pop() || ''
 
-                                for (const line of lines) {
-                                    if (!line.startsWith('data: ')) continue
-                                    const jsonStr = line.slice(6)
-                                    if (jsonStr === '[DONE]') continue
-                                    try {
-                                        const event = JSON.parse(jsonStr)
-                                        if (event.choices?.[0]?.delta?.content) {
-                                            fullContent += event.choices[0].delta.content
-                                        }
-                                    } catch {
-                                        // 忽略解析错误
-                                    }
+                        for (const line of lines) {
+                            if (!line.startsWith('data: ')) continue
+                            const jsonStr = line.slice(6)
+                            if (jsonStr === '[DONE]') continue
+                            try {
+                                const event = JSON.parse(jsonStr)
+                                if (event.choices?.[0]?.delta?.content) {
+                                    fullContent += event.choices[0].delta.content
                                 }
+                            } catch {
+                                // 忽略解析错误
                             }
+                        }
+                    }
 
-                            await env.CONFIG_KV.put(
-                                KV_LAST_RESPONSE,
-                                JSON.stringify({ type: 'stream', content: fullContent }, null, 2)
-                            )
-                        } catch (e) {
-                            console.error('[Log] Failed to collect stream content:', e)
-                        }
-                    })()
-                )
-            } else {
-                ctx.waitUntil(
-                    (async () => {
-                        try {
-                            const responseText = await openaiResponse.text()
-                            await env.CONFIG_KV.put(KV_LAST_RESPONSE, responseText)
-                        } catch (e) {
-                            console.error('[Log] Failed to save response:', e)
-                        }
-                    })()
-                )
-            }
+                    await storage.put(
+                        KV_LAST_RESPONSE,
+                        JSON.stringify({ type: 'stream', content: fullContent }, null, 2)
+                    )
+                } catch (e) {
+                    console.error('[Log] Failed to collect stream content:', e)
+                }
+            })()
+        } else {
+            ;(async () => {
+                try {
+                    const responseText = await openaiResponse.text()
+                    await storage.put(KV_LAST_RESPONSE, responseText)
+                } catch (e) {
+                    console.error('[Log] Failed to save response:', e)
+                }
+            })()
         }
 
         // 直接返回 OpenAI 响应（无需转换格式）
@@ -967,24 +975,20 @@ async function handleOpenAIToOpenAI(
             2
         )
 
-        if (env.CONFIG_KV) {
-            ctx.waitUntil(env.CONFIG_KV.put(KV_LAST_RESPONSE, errorResponse))
-        }
+        storage.put(KV_LAST_RESPONSE, errorResponse)
 
-        ctx.waitUntil(
-            saveRequestLog(env, {
-                id: requestId,
-                timestamp: new Date().toISOString(),
-                model: requestBody?.model || 'unknown',
-                mappedModel: mappedModel || 'unknown',
-                messagesCount: requestBody?.messages?.length || 0,
-                hasImages,
-                stream: !!requestBody?.stream,
-                status: 500,
-                duration: Date.now() - startTime,
-                error: error instanceof Error ? error.message : 'Unknown error'
-            })
-        )
+        saveRequestLog({
+            id: requestId,
+            timestamp: new Date().toISOString(),
+            model: requestBody?.model || 'unknown',
+            mappedModel: mappedModel || 'unknown',
+            messagesCount: requestBody?.messages?.length || 0,
+            hasImages,
+            stream: !!requestBody?.stream,
+            status: 500,
+            duration: Date.now() - startTime,
+            error: error instanceof Error ? error.message : 'Unknown error'
+        })
 
         return new Response(errorResponse, {
             status: 500,
@@ -1017,12 +1021,10 @@ function extractLastUserInput(messages: any[]): string | null {
     return null
 }
 
-// 保存请求日志到 KV（只保留最近 5 条）
-async function saveRequestLog(env: Env, log: RequestLog): Promise<void> {
-    if (!env.CONFIG_KV) return
-
+// 保存请求日志到 storage（只保留最近 5 条）
+async function saveRequestLog(log: RequestLog): Promise<void> {
     try {
-        const existingLogs = await env.CONFIG_KV.get(KV_REQUEST_LOGS)
+        const existingLogs = await storage.get(KV_REQUEST_LOGS)
         let logs: RequestLog[] = existingLogs ? JSON.parse(existingLogs) : []
 
         // 添加新日志到开头
@@ -1031,43 +1033,41 @@ async function saveRequestLog(env: Env, log: RequestLog): Promise<void> {
         // 只保留最近 5 条
         logs = logs.slice(0, 5)
 
-        await env.CONFIG_KV.put(KV_REQUEST_LOGS, JSON.stringify(logs))
+        await storage.put(KV_REQUEST_LOGS, JSON.stringify(logs))
     } catch (e) {
         console.error('[Log] Failed to save request log:', e)
     }
 }
 
 // 获取请求日志 API
-async function handleGetLogs(env: Env): Promise<Response> {
+async function handleGetLogs(): Promise<Response> {
     let logs: RequestLog[] = []
     let lastRequest = ''
     let lastResponse = ''
     let lastUserInput = ''
 
-    if (env.CONFIG_KV) {
-        try {
-            const logsData = await env.CONFIG_KV.get(KV_REQUEST_LOGS)
-            if (logsData) {
-                logs = JSON.parse(logsData)
-            }
-
-            const requestData = await env.CONFIG_KV.get(KV_LAST_REQUEST)
-            if (requestData) {
-                lastRequest = requestData
-            }
-
-            const responseData = await env.CONFIG_KV.get(KV_LAST_RESPONSE)
-            if (responseData) {
-                lastResponse = responseData
-            }
-
-            const userInputData = await env.CONFIG_KV.get(KV_LAST_USER_INPUT)
-            if (userInputData) {
-                lastUserInput = userInputData
-            }
-        } catch (e) {
-            console.error('[Log] Failed to get logs:', e)
+    try {
+        const logsData = await storage.get(KV_REQUEST_LOGS)
+        if (logsData) {
+            logs = JSON.parse(logsData)
         }
+
+        const requestData = await storage.get(KV_LAST_REQUEST)
+        if (requestData) {
+            lastRequest = requestData
+        }
+
+        const responseData = await storage.get(KV_LAST_RESPONSE)
+        if (responseData) {
+            lastResponse = responseData
+        }
+
+        const userInputData = await storage.get(KV_LAST_USER_INPUT)
+        if (userInputData) {
+            lastUserInput = userInputData
+        }
+    } catch (e) {
+        console.error('[Log] Failed to get logs:', e)
     }
 
     return new Response(
@@ -1082,8 +1082,8 @@ async function handleGetLogs(env: Env): Promise<Response> {
 }
 
 // 获取代理服务支持的模型列表
-async function handleGetProxyModels(env: Env): Promise<Response> {
-    const proxyConfig = await getProxyConfig(env)
+async function handleGetProxyModels(): Promise<Response> {
+    const proxyConfig = await getProxyConfig()
     const baseUrl = proxyConfig.baseUrl
     const apiKey = proxyConfig.apiKey
     const proxyType = proxyConfig.type
@@ -1126,11 +1126,9 @@ async function handleGetProxyModels(env: Env): Promise<Response> {
         const modelCount = (data as any).data?.length || 0
         console.log(`[RefreshModels] 成功获取 ${modelCount} 个模型`)
 
-        // 缓存到 KV
-        if (env.CONFIG_KV) {
-            await env.CONFIG_KV.put(KV_AVAILABLE_MODELS, JSON.stringify(data))
-            await env.CONFIG_KV.put(KV_LAST_REFRESH, new Date().toISOString())
-        }
+        // 缓存到 storage
+        await storage.put(KV_AVAILABLE_MODELS, JSON.stringify(data))
+        await storage.put(KV_LAST_REFRESH, new Date().toISOString())
 
         return new Response(JSON.stringify(data), {
             headers: { 'Content-Type': 'application/json' }
@@ -1148,13 +1146,10 @@ async function handleGetProxyModels(env: Env): Promise<Response> {
 }
 
 // 获取当前模型映射配置
-async function handleGetMapping(env: Env): Promise<Response> {
+async function handleGetMapping(): Promise<Response> {
     const currentMapping = claude.getModelMapping()
 
-    let lastRefresh = null
-    if (env.CONFIG_KV) {
-        lastRefresh = await env.CONFIG_KV.get(KV_LAST_REFRESH)
-    }
+    const lastRefresh = await storage.get(KV_LAST_REFRESH)
 
     return new Response(
         JSON.stringify({
@@ -1169,7 +1164,7 @@ async function handleGetMapping(env: Env): Promise<Response> {
 }
 
 // 保存模型映射配置
-async function handleSaveMapping(request: Request, env: Env): Promise<Response> {
+async function handleSaveMapping(request: Request): Promise<Response> {
     try {
         const body = (await request.json()) as { mapping: { [key: string]: string } }
         const newMapping = body.mapping
@@ -1185,9 +1180,7 @@ async function handleSaveMapping(request: Request, env: Env): Promise<Response> 
         claude.setModelMapping(newMapping)
 
         // 保存到 KV
-        if (env.CONFIG_KV) {
-            await env.CONFIG_KV.put(KV_MODEL_MAPPING, JSON.stringify(newMapping))
-        }
+        await storage.put(KV_MODEL_MAPPING, JSON.stringify(newMapping))
 
         return new Response(
             JSON.stringify({
@@ -1210,8 +1203,8 @@ async function handleSaveMapping(request: Request, env: Env): Promise<Response> 
 }
 
 // 自动检测最新模型并设置映射
-async function handleAutoDetect(env: Env): Promise<Response> {
-    const proxyConfig = await getProxyConfig(env)
+async function handleAutoDetect(): Promise<Response> {
+    const proxyConfig = await getProxyConfig()
     const baseUrl = proxyConfig.baseUrl
     const apiKey = proxyConfig.apiKey
     const proxyType = proxyConfig.type
@@ -1224,10 +1217,10 @@ async function handleAutoDetect(env: Env): Promise<Response> {
         // 根据代理类型选择不同的检测逻辑
         if (proxyType === 'openai') {
             console.log(`[AutoDetect] 使用 OpenAI 检测逻辑`)
-            return await autoDetectOpenAI(env, baseUrl, apiKey)
+            return await autoDetectOpenAI(baseUrl, apiKey)
         } else {
             console.log(`[AutoDetect] 使用 Claude 检测逻辑`)
-            return await autoDetectClaude(env, baseUrl, apiKey)
+            return await autoDetectClaude(baseUrl, apiKey)
         }
     } catch (error) {
         console.error(`[AutoDetect] 异常: ${error instanceof Error ? error.message : 'Unknown error'}`)
@@ -1242,7 +1235,7 @@ async function handleAutoDetect(env: Env): Promise<Response> {
 }
 
 // Claude 模型自动检测
-async function autoDetectClaude(env: Env, baseUrl: string, apiKey: string): Promise<Response> {
+async function autoDetectClaude(baseUrl: string, apiKey: string): Promise<Response> {
     const modelsUrl = `${baseUrl}/v1/models`
     console.log(`[AutoDetect-Claude] 请求模型列表: ${modelsUrl}`)
 
@@ -1308,13 +1301,11 @@ async function autoDetectClaude(env: Env, baseUrl: string, apiKey: string): Prom
     // 更新映射
     claude.setModelMapping(newMapping)
 
-    // 保存到 KV
-    if (env.CONFIG_KV) {
-        await env.CONFIG_KV.put(KV_MODEL_MAPPING, JSON.stringify(newMapping))
-        await env.CONFIG_KV.put(KV_AVAILABLE_MODELS, JSON.stringify(data))
-        await env.CONFIG_KV.put(KV_LAST_REFRESH, new Date().toISOString())
-        console.log(`[AutoDetect-Claude] 配置已保存到 KV`)
-    }
+    // 保存到 storage
+    await storage.put(KV_MODEL_MAPPING, JSON.stringify(newMapping))
+    await storage.put(KV_AVAILABLE_MODELS, JSON.stringify(data))
+    await storage.put(KV_LAST_REFRESH, new Date().toISOString())
+    console.log(`[AutoDetect-Claude] 配置已保存到 storage`)
 
     return new Response(
         JSON.stringify({
@@ -1338,7 +1329,7 @@ async function autoDetectClaude(env: Env, baseUrl: string, apiKey: string): Prom
 }
 
 // OpenAI 模型自动检测
-async function autoDetectOpenAI(env: Env, baseUrl: string, apiKey: string): Promise<Response> {
+async function autoDetectOpenAI(baseUrl: string, apiKey: string): Promise<Response> {
     const modelsUrl = `${baseUrl}/v1/models`
     console.log(`[AutoDetect-OpenAI] 请求模型列表: ${modelsUrl}`)
 
@@ -1359,10 +1350,8 @@ async function autoDetectOpenAI(env: Env, baseUrl: string, apiKey: string): Prom
             const defaultMapping = { ...DEFAULT_OPENAI_MODEL_MAPPING }
             setOpenAIModelMapping(defaultMapping)
 
-            if (env.CONFIG_KV) {
-                await env.CONFIG_KV.put(KV_OPENAI_MODEL_MAPPING, JSON.stringify(defaultMapping))
-                await env.CONFIG_KV.put(KV_LAST_REFRESH, new Date().toISOString())
-            }
+            await storage.put(KV_OPENAI_MODEL_MAPPING, JSON.stringify(defaultMapping))
+            await storage.put(KV_LAST_REFRESH, new Date().toISOString())
 
             return new Response(
                 JSON.stringify({
@@ -1385,9 +1374,7 @@ async function autoDetectOpenAI(env: Env, baseUrl: string, apiKey: string): Prom
             const defaultMapping = { ...DEFAULT_OPENAI_MODEL_MAPPING }
             setOpenAIModelMapping(defaultMapping)
 
-            if (env.CONFIG_KV) {
-                await env.CONFIG_KV.put(KV_OPENAI_MODEL_MAPPING, JSON.stringify(defaultMapping))
-            }
+            await storage.put(KV_OPENAI_MODEL_MAPPING, JSON.stringify(defaultMapping))
 
             return new Response(
                 JSON.stringify({
@@ -1441,13 +1428,11 @@ async function autoDetectOpenAI(env: Env, baseUrl: string, apiKey: string): Prom
         // 更新映射
         setOpenAIModelMapping(newMapping)
 
-        // 保存到 KV
-        if (env.CONFIG_KV) {
-            await env.CONFIG_KV.put(KV_OPENAI_MODEL_MAPPING, JSON.stringify(newMapping))
-            await env.CONFIG_KV.put(KV_AVAILABLE_MODELS, JSON.stringify(data))
-            await env.CONFIG_KV.put(KV_LAST_REFRESH, new Date().toISOString())
-            console.log(`[AutoDetect-OpenAI] 配置已保存到 KV`)
-        }
+        // 保存到 storage
+        await storage.put(KV_OPENAI_MODEL_MAPPING, JSON.stringify(newMapping))
+        await storage.put(KV_AVAILABLE_MODELS, JSON.stringify(data))
+        await storage.put(KV_LAST_REFRESH, new Date().toISOString())
+        console.log(`[AutoDetect-OpenAI] 配置已保存到 storage`)
 
         return new Response(
             JSON.stringify({
@@ -1470,9 +1455,7 @@ async function autoDetectOpenAI(env: Env, baseUrl: string, apiKey: string): Prom
         const defaultMapping = { ...DEFAULT_OPENAI_MODEL_MAPPING }
         setOpenAIModelMapping(defaultMapping)
 
-        if (env.CONFIG_KV) {
-            await env.CONFIG_KV.put(KV_OPENAI_MODEL_MAPPING, JSON.stringify(defaultMapping))
-        }
+        await storage.put(KV_OPENAI_MODEL_MAPPING, JSON.stringify(defaultMapping))
 
         return new Response(
             JSON.stringify({
@@ -1488,9 +1471,9 @@ async function autoDetectOpenAI(env: Env, baseUrl: string, apiKey: string): Prom
 }
 
 // 获取代理配置 API（返回两种代理的配置）
-async function handleGetProxyConfig(env: Env): Promise<Response> {
-    const claudeConfig = await getClaudeProxyConfig(env)
-    const openaiConfig = await getOpenAIProxyConfig(env)
+async function handleGetProxyConfig(): Promise<Response> {
+    const claudeConfig = await getClaudeProxyConfig()
+    const openaiConfig = await getOpenAIProxyConfig()
     const activeType = getActiveProxyType()
 
     return new Response(
@@ -1506,15 +1489,15 @@ async function handleGetProxyConfig(env: Env): Promise<Response> {
                 apiKey: openaiConfig.apiKey ? openaiConfig.apiKey.slice(0, 10) + '...' : '',
                 apiKeySet: !!openaiConfig.apiKey
             },
-            envBaseUrl: env.CLAUDE_BASE_URL || 'https://api.anthropic.com',
-            envApiKeySet: !!env.CLAUDE_API_KEY
+            envBaseUrl: ENV.CLAUDE_BASE_URL,
+            envApiKeySet: !!ENV.CLAUDE_API_KEY
         }),
         { headers: { 'Content-Type': 'application/json' } }
     )
 }
 
 // 保存代理配置 API（分别保存两种代理的配置）
-async function handleSaveProxyConfig(request: Request, env: Env): Promise<Response> {
+async function handleSaveProxyConfig(request: Request): Promise<Response> {
     console.log(`[SaveConfig] 收到配置保存请求`)
 
     try {
@@ -1536,12 +1519,12 @@ async function handleSaveProxyConfig(request: Request, env: Env): Promise<Respon
         // 更新激活的代理类型
         if (body.activeType) {
             console.log(`[SaveConfig] 切换代理类型: ${body.activeType}`)
-            await setActiveProxyType(env, body.activeType)
+            await setActiveProxyType(body.activeType)
         }
 
         // 更新 Claude 代理配置
         if (body.claude) {
-            const currentClaudeConfig = await getClaudeProxyConfig(env)
+            const currentClaudeConfig = await getClaudeProxyConfig()
             const newClaudeConfig: ProxyConfig = {
                 baseUrl: body.claude.baseUrl || currentClaudeConfig.baseUrl,
                 apiKey: body.claude.apiKey !== undefined ? body.claude.apiKey : currentClaudeConfig.apiKey
@@ -1550,15 +1533,13 @@ async function handleSaveProxyConfig(request: Request, env: Env): Promise<Respon
             console.log(
                 `[SaveConfig] 更新 Claude 配置: baseUrl=${newClaudeConfig.baseUrl}, apiKeySet=${!!newClaudeConfig.apiKey}`
             )
-            if (env.CONFIG_KV) {
-                await env.CONFIG_KV.put(KV_CLAUDE_PROXY_CONFIG, JSON.stringify(newClaudeConfig))
-                console.log(`[SaveConfig] Claude 配置已保存到 KV`)
-            }
+            await storage.put(KV_CLAUDE_PROXY_CONFIG, JSON.stringify(newClaudeConfig))
+            console.log(`[SaveConfig] Claude 配置已保存到 storage`)
         }
 
         // 更新 OpenAI 代理配置
         if (body.openai) {
-            const currentOpenAIConfig = await getOpenAIProxyConfig(env)
+            const currentOpenAIConfig = await getOpenAIProxyConfig()
             const newOpenAIConfig: ProxyConfig = {
                 baseUrl: body.openai.baseUrl || currentOpenAIConfig.baseUrl,
                 apiKey: body.openai.apiKey !== undefined ? body.openai.apiKey : currentOpenAIConfig.apiKey
@@ -1567,10 +1548,8 @@ async function handleSaveProxyConfig(request: Request, env: Env): Promise<Respon
             console.log(
                 `[SaveConfig] 更新 OpenAI 配置: baseUrl=${newOpenAIConfig.baseUrl}, apiKeySet=${!!newOpenAIConfig.apiKey}`
             )
-            if (env.CONFIG_KV) {
-                await env.CONFIG_KV.put(KV_OPENAI_PROXY_CONFIG, JSON.stringify(newOpenAIConfig))
-                console.log(`[SaveConfig] OpenAI 配置已保存到 KV`)
-            }
+            await storage.put(KV_OPENAI_PROXY_CONFIG, JSON.stringify(newOpenAIConfig))
+            console.log(`[SaveConfig] OpenAI 配置已保存到 storage`)
         }
 
         console.log(`[SaveConfig] 配置保存成功`)
@@ -1602,8 +1581,8 @@ async function handleSaveProxyConfig(request: Request, env: Env): Promise<Respon
 }
 
 // 首页
-async function handleHomePage(env: Env): Promise<Response> {
-    const proxyConfig = await getProxyConfig(env)
+async function handleHomePage(): Promise<Response> {
+    const proxyConfig = await getProxyConfig()
     const currentMapping = claude.getModelMapping()
 
     const html = `<!DOCTYPE html>
@@ -1729,7 +1708,7 @@ async function handleHomePage(env: Env): Promise<Response> {
         </div>
 
         <div class="footer">
-            <p>Powered by <a href="https://workers.cloudflare.com" target="_blank">Cloudflare Workers</a> |
+            <p>Powered by Node.js Local Server |
                <a href="https://github.com" target="_blank">GitHub</a></p>
         </div>
     </div>
@@ -1742,7 +1721,7 @@ async function handleHomePage(env: Env): Promise<Response> {
 }
 
 // 交互式聊天测试页面
-async function handleChatPage(env: Env): Promise<Response> {
+async function handleChatPage(): Promise<Response> {
     const html = `<!DOCTYPE html>
 <html>
 <head>
@@ -2043,11 +2022,11 @@ async function handleChatPage(env: Env): Promise<Response> {
 }
 
 // 配置页面
-async function handleConfigPage(env: Env): Promise<Response> {
+async function handleConfigPage(): Promise<Response> {
     const currentMapping = claude.getModelMapping()
     const mappingJson = JSON.stringify(currentMapping, null, 2)
-    const claudeConfig = await getClaudeProxyConfig(env)
-    const openaiConfig = await getOpenAIProxyConfig(env)
+    const claudeConfig = await getClaudeProxyConfig()
+    const openaiConfig = await getOpenAIProxyConfig()
     const activeType = getActiveProxyType()
 
     const html = `<!DOCTYPE html>
@@ -2442,7 +2421,7 @@ async function handleConfigPage(env: Env): Promise<Response> {
     })
 }
 
-async function handleLogsPage(env: Env): Promise<Response> {
+async function handleLogsPage(): Promise<Response> {
     const html = `<!DOCTYPE html>
 <html>
 <head>
@@ -2540,7 +2519,7 @@ async function handleLogsPage(env: Env): Promise<Response> {
             <li>日志会自动记录最近 5 条 API 请求</li>
             <li>最近一次请求和响应内容可直接复制用于调试</li>
             <li>流式响应会在后台异步收集并保存完整内容</li>
-            <li>如需查看更详细的实时日志，可在终端运行：<code style="background: #0f3460; padding: 2px 8px; border-radius: 4px; color: #00d4ff;">npx wrangler tail</code></li>
+            <li>更详细的实时日志请查看终端控制台输出</li>
         </ul>
     </div>
 
@@ -2726,7 +2705,7 @@ async function handleLogsPage(env: Env): Promise<Response> {
     })
 }
 
-async function handleTestEndpoint(env: Env): Promise<Response> {
+async function handleTestEndpoint(): Promise<Response> {
     const requestId = 'test-' + crypto.randomUUID().slice(0, 8)
     const testRequest = {
         model: 'tinyy-model',
@@ -2735,8 +2714,8 @@ async function handleTestEndpoint(env: Env): Promise<Response> {
         stream: false
     }
 
-    const claudeApiKey = env.CLAUDE_API_KEY
-    const claudeBaseUrl = env.CLAUDE_BASE_URL || 'https://api.anthropic.com'
+    const claudeApiKey = ENV.CLAUDE_API_KEY
+    const claudeBaseUrl = ENV.CLAUDE_BASE_URL
 
     const results: any = {
         timestamp: new Date().toISOString(),

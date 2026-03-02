@@ -3,16 +3,17 @@
     "version": "0.0.0",
     "license": "MIT",
     "scripts": {
-        "deploycf": "npx wrangler types && npx prettier --write . && npx wrangler deploy",
-        "dev": "npx wrangler types && npx prettier --write . && npx wrangler dev --port 8080"
+        "dev": "tsx src/index.ts",
+        "start": "tsx src/index.ts"
     },
-    "packageManager": "pnpm@10.12.2+sha512.a32540185b964ee30bb4e979e405adc6af59226b438ee4cc19f9e8773667a66d302f5bfee60a39d3cac69e35e4b96e708a71dd002b7e9359c4112a1722ac323f",
     "devDependencies": {
+        "@types/node": "^22.0.0",
         "prettier": "^3.6.2",
-        "typescript": "^5.5.2",
-        "wrangler": "^4.21.0"
+        "tsx": "^4.19.0",
+        "typescript": "^5.5.2"
     },
     "dependencies": {
-        "@anthropic-ai/sdk": "^0.71.2"
+        "@anthropic-ai/sdk": "^0.71.2",
+        "dotenv": "^16.4.0"
     }
 }

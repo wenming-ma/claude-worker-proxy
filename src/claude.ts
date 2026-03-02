@@ -63,11 +63,11 @@ export class ClaudeProvider implements provider.Provider {
             stream: openaiRequest.stream
         }
 
-        // 为思考模型启用 thinking 参数
+        // 为思考模型启用 thinking 参数（不限制 budget，让模型自由思考）
         if (enableThinking) {
             claudeRequest.thinking = {
                 type: 'enabled',
-                budget_tokens: 10000
+                budget_tokens: claudeRequest.max_tokens - 1
             }
         }
 
@@ -655,15 +655,11 @@ export class ClaudeProvider implements provider.Provider {
             stream: true
         }
 
-        // 为思考模型启用 thinking 参数
-        // 注意：当有 tool_result 时禁用 thinking，因为某些代理服务不支持这种组合
-        const hasToolResult = messages.some(
-            (m: any) => Array.isArray(m.content) && m.content.some((c: any) => c.type === 'tool_result')
-        )
-        if (enableThinking && !hasToolResult) {
+        // 为思考模型启用 thinking 参数（不限制 budget，让模型自由思考）
+        if (enableThinking) {
             ;(claudeParams as any).thinking = {
                 type: 'enabled',
-                budget_tokens: 10000
+                budget_tokens: claudeParams.max_tokens - 1
             }
         }
 
