@@ -705,61 +705,15 @@ async function handleOpenAIToClaude(
         }
 
         // 保存响应内容到 storage（异步后台执行，不阻塞主流程）
-        if (requestBody?.stream) {
-            // 流式响应：克隆后在后台异步收集完整内容
-            const responseClone = convertedResponse.clone()
-            ;(async () => {
-                try {
-                    const reader = responseClone.body?.getReader()
-                    if (!reader) return
-
-                    const decoder = new TextDecoder()
-                    let buffer = ''
-                    let fullContent = ''
-
-                    while (true) {
-                        const { done, value } = await reader.read()
-                        if (done) break
-
-                        buffer += decoder.decode(value, { stream: true })
-                        const lines = buffer.split('\n')
-                        buffer = lines.pop() || ''
-
-                        for (const line of lines) {
-                            if (!line.startsWith('data: ')) continue
-                            const jsonStr = line.slice(6)
-                            if (jsonStr === '[DONE]') continue
-                            try {
-                                const event = JSON.parse(jsonStr)
-                                if (event.choices?.[0]?.delta?.content) {
-                                    fullContent += event.choices[0].delta.content
-                                }
-                            } catch {
-                                // 忽略解析错误
-                            }
-                        }
-                    }
-
-                    await storage.put(
-                        KV_LAST_RESPONSE,
-                        JSON.stringify({ type: 'stream', content: fullContent }, null, 2)
-                    )
-                } catch (e) {
-                    console.error('[Log] Failed to collect stream content:', e)
-                }
-            })()
-        } else {
-            // 非流式响应：克隆后保存完整内容
-            const responseClone = convertedResponse.clone()
-            ;(async () => {
-                try {
-                    const responseText = await responseClone.text()
-                    await storage.put(KV_LAST_RESPONSE, responseText)
-                } catch (e) {
-                    console.error('[Log] Failed to save response:', e)
-                }
-            })()
-        }
+        const responseClone = convertedResponse.clone()
+        ;(async () => {
+            try {
+                const responseText = await responseClone.text()
+                await storage.put(KV_LAST_RESPONSE, responseText)
+            } catch (e) {
+                console.error('[Log] Failed to save response:', e)
+            }
+        })()
 
         return convertedResponse
     } catch (error) {
@@ -938,58 +892,14 @@ async function handleOpenAIToOpenAI(
         const responseToReturn = openaiResponse.clone()
 
         // 保存响应内容到 storage（异步后台执行）
-        if (requestBody?.stream) {
-            // 流式响应：在后台异步收集完整内容
-            ;(async () => {
-                try {
-                    const reader = openaiResponse.body?.getReader()
-                    if (!reader) return
-
-                    const decoder = new TextDecoder()
-                    let buffer = ''
-                    let fullContent = ''
-
-                    while (true) {
-                        const { done, value } = await reader.read()
-                        if (done) break
-
-                        buffer += decoder.decode(value, { stream: true })
-                        const lines = buffer.split('\n')
-                        buffer = lines.pop() || ''
-
-                        for (const line of lines) {
-                            if (!line.startsWith('data: ')) continue
-                            const jsonStr = line.slice(6)
-                            if (jsonStr === '[DONE]') continue
-                            try {
-                                const event = JSON.parse(jsonStr)
-                                if (event.choices?.[0]?.delta?.content) {
-                                    fullContent += event.choices[0].delta.content
-                                }
-                            } catch {
-                                // 忽略解析错误
-                            }
-                        }
-                    }
-
-                    await storage.put(
-                        KV_LAST_RESPONSE,
-                        JSON.stringify({ type: 'stream', content: fullContent }, null, 2)
-                    )
-                } catch (e) {
-                    console.error('[Log] Failed to collect stream content:', e)
-                }
-            })()
-        } else {
-            ;(async () => {
-                try {
-                    const responseText = await openaiResponse.text()
-                    await storage.put(KV_LAST_RESPONSE, responseText)
-                } catch (e) {
-                    console.error('[Log] Failed to save response:', e)
-                }
-            })()
-        }
+        ;(async () => {
+            try {
+                const responseText = await openaiResponse.text()
+                await storage.put(KV_LAST_RESPONSE, responseText)
+            } catch (e) {
+                console.error('[Log] Failed to save response:', e)
+            }
+        })()
 
         // 直接返回 OpenAI 响应（无需转换格式）
         return responseToReturn

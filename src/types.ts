@@ -10,6 +10,7 @@ export interface ClaudeTool {
     name: string
     description: string
     input_schema: JsonSchema
+    cache_control?: { type: 'ephemeral' }
 }
 
 export type ClaudeContent =
@@ -33,7 +34,7 @@ export interface ClaudeRequest {
     temperature?: number
     stream?: boolean
     tools?: ClaudeTool[]
-    system?: string
+    system?: string | Array<{ type: 'text'; text: string; cache_control?: { type: 'ephemeral' } }>
     thinking?: {
         type: 'enabled' | 'disabled'
         budget_tokens?: number

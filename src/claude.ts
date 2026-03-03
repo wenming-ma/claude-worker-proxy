@@ -1,6 +1,7 @@
 import * as types from './types'
 import * as provider from './provider'
 import * as utils from './utils'
+import * as storage from './storage.js'
 import Anthropic from '@anthropic-ai/sdk'
 
 // 默认模型名称映射表（作为后备）
@@ -44,8 +45,7 @@ function mapModelName(inputModel: string): string {
 export class ClaudeProvider implements provider.Provider {
     async convertToProviderRequest(request: Request, baseUrl: string, apiKey: string): Promise<Request> {
         const openaiRequest = (await request.json()) as types.OpenAIRequest
-        // system 消息已在 convertMessages 中合并到第一个 user 消息，不再单独使用
-        const { messages } = this.convertMessages(openaiRequest.messages)
+        const { messages, system } = this.convertMessages(openaiRequest.messages)
 
         // 应用模型名称映射
         const mappedModel = mapModelName(openaiRequest.model)
@@ -63,6 +63,11 @@ export class ClaudeProvider implements provider.Provider {
             stream: openaiRequest.stream
         }
 
+        // 使用独立 system 字段 + cache_control 断点（断点1）
+        if (system) {
+            claudeRequest.system = [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }]
+        }
+
         // 为思考模型启用 thinking 参数（不限制 budget，让模型自由思考）
         if (enableThinking) {
             claudeRequest.thinking = {
@@ -71,20 +76,20 @@ export class ClaudeProvider implements provider.Provider {
             }
         }
 
-        // 注意：不再使用顶级 system 字段，因为某些代理服务不支持（如 crs.itssx.com）
-        // system 消息已在 convertMessages 中合并到第一个 user 消息中
-
-        // 注意：不传递 temperature 参数，因为某些代理服务（如 imds.ai）
-        // 在 temperature != 1 时会返回 502 错误
-        // Claude 默认使用合适的 temperature，所以不传递也没问题
-
         if (openaiRequest.tools && openaiRequest.tools.length > 0) {
             claudeRequest.tools = openaiRequest.tools.map(tool => ({
                 name: tool.function.name,
                 description: tool.function.description || '',
                 input_schema: utils.cleanJsonSchema(tool.function.parameters || {})
             }))
+            // 断点2：最后一个 tool 定义（session 内不变）
+            if (claudeRequest.tools.length > 0) {
+                claudeRequest.tools[claudeRequest.tools.length - 1].cache_control = { type: 'ephemeral' }
+            }
         }
+
+        // 断点3：倒数第二条 user 消息的最后一个 content block
+        this.addMessageCacheBreakpoints(messages)
 
         const finalUrl = utils.buildUrl(baseUrl, 'v1/messages')
         const headers = new Headers(request.headers)
@@ -120,6 +125,10 @@ export class ClaudeProvider implements provider.Provider {
     } {
         const claudeMessages: types.ClaudeMessage[] = []
         const systemMessages: string[] = []
+
+        // 图片去重：fingerprint → 首次出现的序号
+        const imageMap = new Map<string, number>()
+        let imageCounter = 0
 
         for (const message of openaiMessages) {
             // 收集 system 消息
@@ -204,14 +213,29 @@ export class ClaudeProvider implements provider.Provider {
                                 // Base64 编码的图片
                                 const matches = imageUrl.match(/^data:([^;]+);base64,(.+)$/)
                                 if (matches) {
-                                    content.push({
-                                        type: 'image',
-                                        source: {
-                                            type: 'base64',
-                                            media_type: matches[1],
-                                            data: matches[2]
-                                        }
-                                    })
+                                    const base64Data = matches[2]
+                                    // 图片去重：用前100字符+长度作为指纹
+                                    const fingerprint = base64Data.substring(0, 100) + ':' + base64Data.length
+                                    const existingIndex = imageMap.get(fingerprint)
+                                    if (existingIndex !== undefined) {
+                                        // 重复图片，替换为文本引用
+                                        content.push({
+                                            type: 'text',
+                                            text: `[Image #${existingIndex} - same as above]`
+                                        })
+                                    } else {
+                                        // 首次出现，保留完整图片
+                                        imageCounter++
+                                        imageMap.set(fingerprint, imageCounter)
+                                        content.push({
+                                            type: 'image',
+                                            source: {
+                                                type: 'base64',
+                                                media_type: matches[1],
+                                                data: base64Data
+                                            }
+                                        })
+                                    }
                                 }
                             } else {
                                 // URL 图片 - Claude 需要 base64，这里先作为文本提示
@@ -237,37 +261,38 @@ export class ClaudeProvider implements provider.Provider {
             }
 
             if (content.length > 0) {
-                claudeMessages.push({
-                    role: message.role === 'assistant' ? 'assistant' : 'user',
-                    content: content.length === 1 && content[0].type === 'text' ? content[0].text : content
-                })
-            }
-        }
+                const role = message.role === 'assistant' ? 'assistant' : 'user'
 
-        // 如果有 system 消息，将其合并到第一个 user 消息中
-        // 这是为了兼容不支持顶级 system 字段的代理服务（如 crs.itssx.com）
-        const systemPrompt = systemMessages.length > 0 ? systemMessages.join('\n\n') : undefined
-        if (systemPrompt && claudeMessages.length > 0) {
-            const firstUserIndex = claudeMessages.findIndex(m => m.role === 'user')
-            if (firstUserIndex !== -1) {
-                const firstUserMsg = claudeMessages[firstUserIndex]
-                if (typeof firstUserMsg.content === 'string') {
-                    // 将 system 消息前置到第一个 user 消息
-                    firstUserMsg.content = `[System Instructions]\n${systemPrompt}\n\n[User Message]\n${firstUserMsg.content}`
-                } else if (Array.isArray(firstUserMsg.content)) {
-                    // 对于数组格式的内容，在开头插入 system 文本
-                    firstUserMsg.content.unshift({
-                        type: 'text',
-                        text: `[System Instructions]\n${systemPrompt}\n\n[User Message]`
+                // 合并连续的同角色 user 消息（避免违反交替规则）
+                const lastMessage = claudeMessages[claudeMessages.length - 1]
+                if (role === 'user' && lastMessage && lastMessage.role === 'user') {
+                    // 将两个消息的 content 合并为数组
+                    const prevContent = typeof lastMessage.content === 'string'
+                        ? [{ type: 'text' as const, text: lastMessage.content }]
+                        : (lastMessage.content as any[])
+                    const newContent = content.length === 1 && content[0].type === 'text'
+                        ? [content[0]]
+                        : content
+                    lastMessage.content = [...prevContent, ...newContent]
+                } else {
+                    claudeMessages.push({
+                        role,
+                        content: content.length === 1 && content[0].type === 'text' ? content[0].text : content
                     })
                 }
             }
         }
 
+        // 返回 system 作为独立字段，利用 Claude 的 prompt caching
+        const systemPrompt = systemMessages.length > 0 ? systemMessages.join('\n\n') : undefined
+
+        if (imageMap.size > 0) {
+            console.log(`[ImageDedup] ${imageCounter} unique images, ${imageMap.size} fingerprints tracked`)
+        }
+
         return {
             messages: claudeMessages,
-            // 不再返回顶级 system 字段，因为某些代理不支持
-            system: undefined
+            system: systemPrompt
         }
     }
 
@@ -623,6 +648,35 @@ export class ClaudeProvider implements provider.Provider {
         }
     }
 
+    /**
+     * 在倒数第二条 user 消息的最后一个 content block 添加 cache_control 断点
+     * 这样历史消息可以被缓存，只有最新一轮对话需要重新处理
+     */
+    private addMessageCacheBreakpoints(messages: types.ClaudeMessage[]): void {
+        // 找到所有 user 消息的索引
+        const userIndices: number[] = []
+        for (let i = 0; i < messages.length; i++) {
+            if (messages[i].role === 'user') {
+                userIndices.push(i)
+            }
+        }
+
+        // 至少需要 2 条 user 消息才有意义（倒数第二条）
+        if (userIndices.length < 2) return
+
+        const secondToLastUserIdx = userIndices[userIndices.length - 2]
+        const msg = messages[secondToLastUserIdx]
+
+        if (typeof msg.content === 'string') {
+            // 转为数组格式以添加 cache_control
+            msg.content = [{ type: 'text', text: msg.content, cache_control: { type: 'ephemeral' } }] as any
+        } else if (Array.isArray(msg.content) && msg.content.length > 0) {
+            // 在最后一个 content block 添加 cache_control
+            const lastBlock = msg.content[msg.content.length - 1] as any
+            lastBlock.cache_control = { type: 'ephemeral' }
+        }
+    }
+
     private convertStopReason(claudeStopReason?: string): string | null {
         switch (claudeStopReason) {
             case 'end_turn':
@@ -641,7 +695,7 @@ export class ClaudeProvider implements provider.Provider {
      * 比手动 SSE 解析更稳定可靠
      */
     async convertStreamWithSDK(baseUrl: string, apiKey: string, openaiRequest: types.OpenAIRequest): Promise<Response> {
-        const { messages } = this.convertMessages(openaiRequest.messages)
+        const { messages, system } = this.convertMessages(openaiRequest.messages)
         const mappedModel = mapModelName(openaiRequest.model)
         const enableThinking = THINKING_MODELS.has(openaiRequest.model)
 
@@ -653,6 +707,11 @@ export class ClaudeProvider implements provider.Provider {
                 ? Math.max(openaiRequest.max_tokens || 16000, 16000)
                 : openaiRequest.max_tokens || 4096,
             stream: true
+        }
+
+        // 使用独立 system 字段 + cache_control 断点（断点1）
+        if (system) {
+            ;(claudeParams as any).system = [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }]
         }
 
         // 为思考模型启用 thinking 参数（不限制 budget，让模型自由思考）
@@ -670,7 +729,14 @@ export class ClaudeProvider implements provider.Provider {
                 description: tool.function.description || '',
                 input_schema: utils.cleanJsonSchema(tool.function.parameters || {}) as Anthropic.Tool.InputSchema
             }))
+            // 断点2：最后一个 tool 定义（session 内不变）
+            if (claudeParams.tools.length > 0) {
+                ;(claudeParams.tools[claudeParams.tools.length - 1] as any).cache_control = { type: 'ephemeral' }
+            }
         }
+
+        // 断点3：倒数第二条 user 消息的最后一个 content block
+        this.addMessageCacheBreakpoints(messages)
 
         // 创建 SDK 客户端
         const client = new Anthropic({
@@ -841,6 +907,17 @@ export class ClaudeProvider implements provider.Provider {
                 console.log(
                     `[SDK Stream] Final message stop_reason: ${finalMessage.stop_reason}, mapped to: ${finishReason}`
                 )
+
+                // 记录缓存指标
+                const usage = finalMessage.usage as any
+                if (usage) {
+                    console.log(
+                        `[SDK Stream] Cache: read=${usage.cache_read_input_tokens || 0}, creation=${usage.cache_creation_input_tokens || 0}, input=${usage.input_tokens || 0}`
+                    )
+                }
+
+                // 保存原始 Claude 响应（Claude → 我们）
+                storage.put('provider_response', JSON.stringify(finalMessage, null, 2))
 
                 // 发送 finish_reason
                 const finishChunk = {
