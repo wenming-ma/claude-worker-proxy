@@ -102,8 +102,10 @@ const KV_CLAUDE_PROXY_CONFIG = 'claude_proxy_config' // Claude 代理配置
 const KV_OPENAI_PROXY_CONFIG = 'openai_proxy_config' // OpenAI 代理配置
 const KV_ACTIVE_PROXY_TYPE = 'active_proxy_type' // 当前激活的代理类型
 const KV_REQUEST_LOGS = 'request_logs'
-const KV_LAST_REQUEST = 'last_request'
-const KV_LAST_RESPONSE = 'last_response'
+const KV_LAST_REQUEST = 'last_request'           // Cursor → 我们
+const KV_FORWARDED_REQUEST = 'forwarded_request'  // 我们 → Claude/OpenAI
+const KV_PROVIDER_RESPONSE = 'provider_response'  // Claude/OpenAI → 我们
+const KV_LAST_RESPONSE = 'last_response'           // 我们 → Cursor
 const KV_LAST_USER_INPUT = 'last_user_input'
 
 // 代理配置接口
@@ -572,6 +574,16 @@ async function handleOpenAIToClaude(
         if (requestBody?.stream) {
             console.log(`[${requestId}] Using SDK for streaming`)
 
+            // 保存转发请求（我们 → Claude，流式模式由 SDK 处理）
+            const fakeReq = new Request('http://localhost/v1/chat/completions', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(requestBody)
+            })
+            const convertedReq = await provider.convertToProviderRequest(fakeReq, claudeBaseUrl, claudeApiKey)
+            convertedReq.json().then((body: any) => {
+                storage.put(KV_FORWARDED_REQUEST, JSON.stringify(body, null, 2))
+            }).catch(() => {})
+
             try {
                 convertedResponse = await provider.convertStreamWithSDK(claudeBaseUrl, claudeApiKey, requestBody)
 
@@ -626,8 +638,20 @@ async function handleOpenAIToClaude(
             const claudeRequest = await provider.convertToProviderRequest(request, claudeBaseUrl, claudeApiKey)
             console.log(`[${requestId}] Claude request URL: ${claudeRequest.url}`)
 
+            // 保存转发请求（我们 → Claude）
+            const claudeReqClone = claudeRequest.clone()
+            claudeReqClone.json().then((body: any) => {
+                storage.put(KV_FORWARDED_REQUEST, JSON.stringify(body, null, 2))
+            }).catch(() => {})
+
             const claudeResponse = await fetchWithRetry(claudeRequest, requestId)
             console.log(`[${requestId}] Claude response status: ${claudeResponse.status}`)
+
+            // 保存原始响应（Claude → 我们）
+            const providerResClone = claudeResponse.clone()
+            providerResClone.text().then((text: string) => {
+                storage.put(KV_PROVIDER_RESPONSE, text)
+            }).catch(() => {})
 
             if (!claudeResponse.ok) {
                 const errorBody = await claudeResponse.clone().text()
@@ -851,8 +875,17 @@ async function handleOpenAIToOpenAI(
 
         console.log(`[${requestId}] Forward URL: ${forwardUrl}`)
 
+        // 保存转发请求（我们 → OpenAI）
+        storage.put(KV_FORWARDED_REQUEST, JSON.stringify(requestBody, null, 2))
+
         const openaiResponse = await fetchWithRetry(forwardRequest, requestId)
         console.log(`[${requestId}] OpenAI response status: ${openaiResponse.status}`)
+
+        // 保存原始响应（OpenAI → 我们）
+        const providerResClone = openaiResponse.clone()
+        providerResClone.text().then((text: string) => {
+            storage.put(KV_PROVIDER_RESPONSE, text)
+        }).catch(() => {})
 
         if (!openaiResponse.ok) {
             const errorBody = await openaiResponse.clone().text()
@@ -1043,8 +1076,9 @@ async function saveRequestLog(log: RequestLog): Promise<void> {
 async function handleGetLogs(): Promise<Response> {
     let logs: RequestLog[] = []
     let lastRequest = ''
+    let forwardedRequest = ''
+    let providerResponse = ''
     let lastResponse = ''
-    let lastUserInput = ''
 
     try {
         const logsData = await storage.get(KV_REQUEST_LOGS)
@@ -1053,19 +1087,16 @@ async function handleGetLogs(): Promise<Response> {
         }
 
         const requestData = await storage.get(KV_LAST_REQUEST)
-        if (requestData) {
-            lastRequest = requestData
-        }
+        if (requestData) lastRequest = requestData
+
+        const forwardedData = await storage.get(KV_FORWARDED_REQUEST)
+        if (forwardedData) forwardedRequest = forwardedData
+
+        const providerData = await storage.get(KV_PROVIDER_RESPONSE)
+        if (providerData) providerResponse = providerData
 
         const responseData = await storage.get(KV_LAST_RESPONSE)
-        if (responseData) {
-            lastResponse = responseData
-        }
-
-        const userInputData = await storage.get(KV_LAST_USER_INPUT)
-        if (userInputData) {
-            lastUserInput = userInputData
-        }
+        if (responseData) lastResponse = responseData
     } catch (e) {
         console.error('[Log] Failed to get logs:', e)
     }
@@ -1074,8 +1105,9 @@ async function handleGetLogs(): Promise<Response> {
         JSON.stringify({
             logs,
             lastRequest,
-            lastResponse,
-            lastUserInput
+            forwardedRequest,
+            providerResponse,
+            lastResponse
         }),
         { headers: { 'Content-Type': 'application/json' } }
     )
@@ -2474,7 +2506,7 @@ async function handleLogsPage(): Promise<Response> {
 
     <div class="card">
         <div class="header-row">
-            <h2>📊 最近 5 条请求</h2>
+            <h2>📊 最近请求概览</h2>
             <button class="btn btn-outline btn-sm" onclick="refreshLogs()">刷新</button>
         </div>
         <div id="logsContainer">
@@ -2482,45 +2514,40 @@ async function handleLogsPage(): Promise<Response> {
         </div>
     </div>
 
-    <div class="card" style="border: 2px solid #00d4ff;">
+    <div class="card" style="border-left: 3px solid #00d4ff;">
         <div class="header-row">
-            <h2>✏️ 用户最后一次输入</h2>
-            <button class="btn btn-primary btn-sm" id="copyUserInputBtn" onclick="copyUserInput()">一键复制</button>
+            <h2>1️⃣ Cursor → 我们</h2>
+            <button class="btn btn-primary btn-sm" onclick="copyBlock('cursorToUs')">复制</button>
         </div>
-        <div class="copy-wrapper">
-            <pre id="lastUserInput" style="max-height: 200px; white-space: pre-wrap;">加载中...</pre>
-        </div>
-        <p style="color: #888; font-size: 12px; margin-top: 10px;">💡 只包含用户在 Cursor 输入框中输入的内容，不含系统消息和上下文</p>
+        <p style="color: #888; font-size: 12px; margin-bottom: 10px;">Cursor 发送给代理的原始请求（OpenAI 格式）</p>
+        <pre id="cursorToUs">加载中...</pre>
     </div>
 
-    <div class="card">
+    <div class="card" style="border-left: 3px solid #e94560;">
         <div class="header-row">
-            <h2>📝 最近一次请求内容</h2>
-            <button class="btn btn-primary btn-sm" id="copyRequestBtn" onclick="copyRequest()">复制</button>
+            <h2>2️⃣ 我们 → Claude/OpenAI</h2>
+            <button class="btn btn-primary btn-sm" onclick="copyBlock('usToProvider')">复制</button>
         </div>
-        <div class="copy-wrapper">
-            <pre id="lastRequest">加载中...</pre>
-        </div>
+        <p style="color: #888; font-size: 12px; margin-bottom: 10px;">代理转换后转发给上游 API 的请求</p>
+        <pre id="usToProvider">加载中...</pre>
     </div>
 
-    <div class="card">
+    <div class="card" style="border-left: 3px solid #00ff88;">
         <div class="header-row">
-            <h2>📤 最近一次响应内容</h2>
-            <button class="btn btn-primary btn-sm" id="copyResponseBtn" onclick="copyResponse()">复制</button>
+            <h2>3️⃣ Claude/OpenAI → 我们</h2>
+            <button class="btn btn-primary btn-sm" onclick="copyBlock('providerToUs')">复制</button>
         </div>
-        <div class="copy-wrapper">
-            <pre id="lastResponse">加载中...</pre>
-        </div>
+        <p style="color: #888; font-size: 12px; margin-bottom: 10px;">上游 API 返回的原始响应</p>
+        <pre id="providerToUs">加载中...</pre>
     </div>
 
-    <div class="card">
-        <h2>💡 说明</h2>
-        <ul style="line-height: 2; color: #aaa; padding-left: 20px;">
-            <li>日志会自动记录最近 5 条 API 请求</li>
-            <li>最近一次请求和响应内容可直接复制用于调试</li>
-            <li>流式响应会在后台异步收集并保存完整内容</li>
-            <li>更详细的实时日志请查看终端控制台输出</li>
-        </ul>
+    <div class="card" style="border-left: 3px solid #ffaa00;">
+        <div class="header-row">
+            <h2>4️⃣ 我们 → Cursor</h2>
+            <button class="btn btn-primary btn-sm" onclick="copyBlock('usToCursor')">复制</button>
+        </div>
+        <p style="color: #888; font-size: 12px; margin-bottom: 10px;">代理转换后返回给 Cursor 的响应（OpenAI 格式）</p>
+        <pre id="usToCursor">加载中...</pre>
     </div>
 
     <script>
@@ -2529,63 +2556,24 @@ async function handleLogsPage(): Promise<Response> {
                 const res = await fetch('/api/logs');
                 const data = await res.json();
 
-                // 渲染日志表格
+                // 概览表格
                 const container = document.getElementById('logsContainer');
                 if (data.logs && data.logs.length > 0) {
-                    let html = '<table class="log-table"><thead><tr>';
-                    html += '<th>时间</th><th>请求 ID</th><th>模型</th><th>映射到</th><th>消息数</th><th>状态</th><th>耗时</th>';
-                    html += '</tr></thead><tbody>';
-
-                    for (const log of data.logs) {
-                        const time = new Date(log.timestamp).toLocaleString('zh-CN');
-                        const statusClass = log.status >= 200 && log.status < 300 ? 'success' : 'error';
-                        const statusText = log.status >= 200 && log.status < 300 ? '成功' : '失败';
-
-                        html += '<tr>';
-                        html += '<td class="time-ago">' + time + '</td>';
-                        html += '<td><code>' + log.id + '</code></td>';
-                        html += '<td><span class="model-tag">' + log.model + '</span></td>';
-                        html += '<td><span class="model-tag">' + log.mappedModel + '</span></td>';
-                        html += '<td>' + log.messagesCount + (log.hasImages ? ' 📷' : '') + (log.stream ? ' 🌊' : '') + '</td>';
-                        html += '<td><span class="status ' + statusClass + '">' + log.status + ' ' + statusText + '</span>';
-                        if (log.error) {
-                            html += '<div class="error-text">' + log.error + '</div>';
-                        }
-                        html += '</td>';
-                        html += '<td>' + log.duration + 'ms</td>';
-                        html += '</tr>';
-                    }
-
-                    html += '</tbody></table>';
-                    container.innerHTML = html;
+                    const log = data.logs[0];
+                    const time = new Date(log.timestamp).toLocaleString('zh-CN');
+                    const statusClass = log.status >= 200 && log.status < 300 ? 'success' : 'error';
+                    container.innerHTML = '<p style="color:#aaa;">最近一次: <code>' + log.id + '</code> | ' +
+                        '<span class="model-tag">' + log.model + '</span> → <span class="model-tag">' + log.mappedModel + '</span> | ' +
+                        '<span class="status ' + statusClass + '">' + log.status + '</span> | ' +
+                        log.duration + 'ms | ' + time + '</p>';
                 } else {
                     container.innerHTML = '<div class="empty-state">暂无请求日志</div>';
                 }
 
-                // 渲染用户最后一次输入
-                const userInputPre = document.getElementById('lastUserInput');
-                if (data.lastUserInput) {
-                    userInputPre.textContent = data.lastUserInput;
-                } else {
-                    userInputPre.textContent = '暂无用户输入记录';
-                }
-
-                // 渲染最近请求
-                const requestPre = document.getElementById('lastRequest');
-                if (data.lastRequest) {
-                    requestPre.textContent = data.lastRequest;
-                } else {
-                    requestPre.textContent = '暂无请求记录';
-                }
-
-                // 渲染最近响应
-                const responsePre = document.getElementById('lastResponse');
-                if (data.lastResponse) {
-                    responsePre.textContent = data.lastResponse;
-                } else {
-                    responsePre.textContent = '暂无响应记录';
-                }
-
+                setText('cursorToUs', data.lastRequest);
+                setText('usToProvider', data.forwardedRequest);
+                setText('providerToUs', data.providerResponse);
+                setText('usToCursor', data.lastResponse);
             } catch (e) {
                 console.error('Failed to load logs:', e);
                 document.getElementById('logsContainer').innerHTML =
@@ -2593,109 +2581,26 @@ async function handleLogsPage(): Promise<Response> {
             }
         }
 
-        async function copyUserInput() {
-            const content = document.getElementById('lastUserInput').textContent;
-            if (!content || content === '暂无用户输入记录' || content === '加载中...') {
-                return;
-            }
+        function setText(id, text) {
+            const el = document.getElementById(id);
+            el.textContent = text || '暂无数据';
+        }
 
+        async function copyBlock(id) {
+            const content = document.getElementById(id).textContent;
+            if (!content || content === '暂无数据' || content === '加载中...') return;
             try {
                 await navigator.clipboard.writeText(content);
-                const btn = document.getElementById('copyUserInputBtn');
-                btn.textContent = '已复制!';
-                btn.classList.add('copied');
-                setTimeout(() => {
-                    btn.textContent = '一键复制';
-                    btn.classList.remove('copied');
-                }, 2000);
             } catch (e) {
-                // 降级方案
-                const textarea = document.createElement('textarea');
-                textarea.value = content;
-                document.body.appendChild(textarea);
-                textarea.select();
+                const ta = document.createElement('textarea');
+                ta.value = content;
+                document.body.appendChild(ta);
+                ta.select();
                 document.execCommand('copy');
-                document.body.removeChild(textarea);
-
-                const btn = document.getElementById('copyUserInputBtn');
-                btn.textContent = '已复制!';
-                btn.classList.add('copied');
-                setTimeout(() => {
-                    btn.textContent = '一键复制';
-                    btn.classList.remove('copied');
-                }, 2000);
+                document.body.removeChild(ta);
             }
         }
 
-        async function copyRequest() {
-            const content = document.getElementById('lastRequest').textContent;
-            if (!content || content === '暂无请求记录' || content === '加载中...') {
-                return;
-            }
-
-            try {
-                await navigator.clipboard.writeText(content);
-                const btn = document.getElementById('copyRequestBtn');
-                btn.textContent = '已复制!';
-                btn.classList.add('copied');
-                setTimeout(() => {
-                    btn.textContent = '复制';
-                    btn.classList.remove('copied');
-                }, 2000);
-            } catch (e) {
-                // 降级方案
-                const textarea = document.createElement('textarea');
-                textarea.value = content;
-                document.body.appendChild(textarea);
-                textarea.select();
-                document.execCommand('copy');
-                document.body.removeChild(textarea);
-
-                const btn = document.getElementById('copyRequestBtn');
-                btn.textContent = '已复制!';
-                btn.classList.add('copied');
-                setTimeout(() => {
-                    btn.textContent = '复制';
-                    btn.classList.remove('copied');
-                }, 2000);
-            }
-        }
-
-        async function copyResponse() {
-            const content = document.getElementById('lastResponse').textContent;
-            if (!content || content === '暂无响应记录' || content === '加载中...') {
-                return;
-            }
-
-            try {
-                await navigator.clipboard.writeText(content);
-                const btn = document.getElementById('copyResponseBtn');
-                btn.textContent = '已复制!';
-                btn.classList.add('copied');
-                setTimeout(() => {
-                    btn.textContent = '复制';
-                    btn.classList.remove('copied');
-                }, 2000);
-            } catch (e) {
-                // 降级方案
-                const textarea = document.createElement('textarea');
-                textarea.value = content;
-                document.body.appendChild(textarea);
-                textarea.select();
-                document.execCommand('copy');
-                document.body.removeChild(textarea);
-
-                const btn = document.getElementById('copyResponseBtn');
-                btn.textContent = '已复制!';
-                btn.classList.add('copied');
-                setTimeout(() => {
-                    btn.textContent = '复制';
-                    btn.classList.remove('copied');
-                }, 2000);
-            }
-        }
-
-        // 初始化
         refreshLogs();
     </script>
 </body>
